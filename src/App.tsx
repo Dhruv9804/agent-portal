@@ -5,15 +5,15 @@ import {
   Check, LogOut, Home, ClipboardList, BookOpen, User, ChevronRight,
   Package, FileText, Film, X, RefreshCw, AlertCircle, Download,
   TrendingUp, Clock, Truck, Users, Eye, Search, Filter, Calendar,
-  Briefcase, Tag, Heart, Pin, Sparkles, FileX,
+  Briefcase, Tag, Heart, Pin, Sparkles, FileX, FolderOpen,
 } from 'lucide-react';
 import {
   APSession, apLogin, apChangePin, apRefreshToken, clearSession, loadSession, saveSession,
   submitAgentRequest, warmUpEdgeFunction, jwtIsExpired,
-  fetchAgentId, fetchMyCustomers, fetchMyOrders, fetchMyChallans,
+  fetchAgentId, fetchAgentNameFromDb, fetchMyCustomers, fetchOrdersByAgent, fetchMyChallans,
   fetchCatalogs, fetchVolumes, enrichWithVolumes, resolveStorageUrl, preBatchSignUrls,
   fetchLikes, toggleLike,
-  Agent, Customer, Order, Challan, Catalog, Volume, LikeData,
+  Agent, Customer, Order, Challan, Catalog, CatalogCategory, Volume, LikeData,
 } from './lib/supabase';
 import { startRealtimeSync, stopRealtimeSync, updateRealtimeToken } from './lib/realtimeSync';
 import { Browser } from '@capacitor/browser';
@@ -212,14 +212,27 @@ function LoginScreen({ onSuccess, showToast }: {
     if (!email.trim()) { showToast('Enter your email address.', 'error'); return; }
     if (pin.length < 4) { showToast('Enter your PIN (min 4 characters).', 'error'); return; }
     setLoading(true);
-    const result = await apLogin(email, pin);
+    let result: Awaited<ReturnType<typeof apLogin>>;
+    try { result = await apLogin(email, pin); }
+    catch { result = { error: 'Network error. Check your connection and try again.' }; }
     setLoading(false);
     if (result.error) {
-      const cur = getRateData();
-      const attempts = (cur.attempts || 0) + 1;
-      const lockedUntil = attempts >= AP_MAX_ATTEMPTS ? Date.now() + AP_LOCKOUT_MS : (cur.lockedUntil || 0);
-      try { sessionStorage.setItem(AP_RATE_KEY, JSON.stringify({ attempts, lockedUntil })); } catch { /* ignore */ }
-      showToast(attempts >= AP_MAX_ATTEMPTS ? 'Too many failed attempts. Locked for 15 minutes.' : result.error, 'error');
+      // Only count genuine auth failures (wrong PIN / device limit) toward the
+      // lockout — network/connection errors are outside the user's control and
+      // must not burn their attempt budget.
+      const isAuthFailure = /invalid email or pin|access denied|device limit/i.test(result.error)
+        || !!result.deviceLimitReached;
+      if (isAuthFailure) {
+        const cur = getRateData();
+        const attempts = (cur.attempts || 0) + 1;
+        const lockedUntil = attempts >= AP_MAX_ATTEMPTS ? Date.now() + AP_LOCKOUT_MS : (cur.lockedUntil || 0);
+        try { sessionStorage.setItem(AP_RATE_KEY, JSON.stringify({ attempts, lockedUntil })); } catch { /* ignore */ }
+        if (attempts >= AP_MAX_ATTEMPTS) {
+          showToast('Too many failed attempts. Locked for 15 minutes.', 'error');
+          return;
+        }
+      }
+      showToast(result.error, 'error');
       return;
     }
     try { sessionStorage.removeItem(AP_RATE_KEY); } catch { /* ignore */ }
@@ -245,7 +258,7 @@ function LoginScreen({ onSuccess, showToast }: {
           <Briefcase size={44} className="text-white relative z-10" />
         </div>
         <h1 className="text-3xl font-black tracking-tight text-center text-zinc-900 dark:text-zinc-100">
-          Kanika <span className="text-amber-500">Agents</span>
+          <span className="text-amber-500">Agents</span>
         </h1>
         <p className="text-xs text-zinc-400 mt-1.5 text-center font-bold uppercase tracking-widest">
           Kanika × S.I.M. Agent Portal
@@ -292,6 +305,13 @@ function LoginScreen({ onSuccess, showToast }: {
                   {loading ? <Loader2 size={18} className="animate-spin" /> : <Key size={18} />}
                   {loading ? 'Signing in…' : lockoutRemaining > 0 ? `Locked (${lockoutRemaining}s)` : 'Sign In'}
                 </button>
+                {lockoutRemaining > 0 && (
+                  <button type="button"
+                    onClick={() => { try { sessionStorage.removeItem(AP_RATE_KEY); } catch { /**/ } setLockoutRemaining(0); }}
+                    className="w-full text-center text-[11px] font-bold text-zinc-400 hover:text-amber-500 py-1">
+                    Locked due to a connection error? Tap to unlock
+                  </button>
+                )}
               </form>
             )}
           </div>
@@ -330,10 +350,16 @@ function fmtDate(iso: string) {
 }
 
 // ── Order Card ────────────────────────────────────────────────────────────────
-function OrderCard({ order, highlight }: { order: Order; highlight?: string }) {
+function OrderCard({ order, highlight, mode }: { order: Order; highlight?: string; mode?: OrderFilterMode }) {
   const [expanded, setExpanded] = useState(false);
   const pending = order.status !== 'Delivered';
   const totalPcs = order.items.reduce((s, i) => s + (i.quantity || 0), 0);
+
+  // Unique catalog names for the collapsed summary line
+  const catalogSummary = useMemo(() => {
+    const names = [...new Set(order.items.map(i => i.catalog_name).filter(Boolean))] as string[];
+    return names.length ? names.join(' · ') : null;
+  }, [order.items]);
 
   return (
     <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 shadow-sm overflow-hidden">
@@ -346,7 +372,11 @@ function OrderCard({ order, highlight }: { order: Order; highlight?: string }) {
             </span>
             {highlight && <span className="text-[10px] font-bold text-indigo-500 bg-indigo-50 dark:bg-indigo-900/20 px-2 py-0.5 rounded-full">{highlight}</span>}
           </div>
-          <p className="font-black text-zinc-900 dark:text-zinc-100 mt-1 truncate">{order.customer_name}</p>
+          {mode === 'catalog'
+            ? <p className="font-black text-zinc-900 dark:text-zinc-100 mt-1 truncate">{order.customer_name || '—'}</p>
+            : catalogSummary
+              ? <p className="font-black text-zinc-900 dark:text-zinc-100 mt-1 truncate">{catalogSummary}</p>
+              : <p className="font-black text-zinc-400 mt-1 truncate">{order.items.length} item{order.items.length !== 1 ? 's' : ''}</p>}
           <p className="text-[11px] text-zinc-400">{order.city_name} · {fmtDate(order.created_at)}</p>
         </div>
         <div className="text-right ml-3 shrink-0">
@@ -586,27 +616,91 @@ function CatalogModal({
   );
 }
 
+// ── Folder Tile (category card in folder view) ────────────────────────────────
+function FolderTile({ name, count, coverUrls, onClick, token }: {
+  name: string; count: number; coverUrls: string[]; onClick: () => void; token: string;
+}) {
+  const imgs = coverUrls.slice(0, 4);
+  return (
+    <button onClick={onClick}
+      className="rounded-2xl overflow-hidden border border-zinc-100 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm active:scale-95 transition-transform text-left">
+      {/* 2×2 collage */}
+      <div className="aspect-square bg-zinc-100 dark:bg-zinc-800 relative overflow-hidden">
+        {imgs.length > 0 ? (
+          <div className={`w-full h-full grid ${imgs.length === 1 ? 'grid-cols-1' : 'grid-cols-2'} gap-px`}>
+            {imgs.map((url, i) => (
+              <StorageImg key={i} src={url} alt="" className="w-full h-full object-cover" token={token} />
+            ))}
+            {/* Fill empty slots with solid bg */}
+            {imgs.length === 3 && <div className="w-full h-full bg-zinc-200 dark:bg-zinc-700" />}
+          </div>
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <FolderOpen size={28} className="text-zinc-300 dark:text-zinc-600" />
+          </div>
+        )}
+        {/* Gradient overlay + count badge */}
+        <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent" />
+        <div className="absolute bottom-2 right-2 bg-amber-500 text-white text-[9px] font-black px-1.5 py-0.5 rounded-full">
+          {count}
+        </div>
+      </div>
+      <div className="px-2 py-2">
+        <p className="text-[10px] font-black text-zinc-900 dark:text-zinc-100 truncate leading-tight">{name}</p>
+        <p className="text-[9px] text-zinc-400 mt-0.5">{count} catalog{count !== 1 ? 's' : ''}</p>
+      </div>
+    </button>
+  );
+}
+
 // ── Catalog Screen ────────────────────────────────────────────────────────────
-function CatalogScreen({ catalogs, volumes, token, likes, onLike }: {
+function CatalogScreen({ catalogs, volumes, token, likes, onLike, categories }: {
   catalogs: Catalog[]; volumes: Volume[]; token: string;
   likes: LikeData; onLike: (id: number) => void;
+  categories: CatalogCategory[];
 }) {
-  const [selectedCatalog, setSelectedCatalog] = useState<Catalog | null>(null);
-  const [pdfViewer, setPdfViewer]             = useState<{ url: string; title: string } | null>(null);
-  const [videoViewer, setVideoViewer]         = useState<{ url: string; title: string } | null>(null);
-  const [resolving, setResolving]             = useState<number | null>(null);
-  const [search, setSearch]                   = useState('');
+  // null = folder view, -1 = all, 0 = uncategorized, N = specific category
+  const [browsedCategoryId, setBrowsedCategoryId] = useState<number | null>(null);
+  const [selectedCatalog, setSelectedCatalog]     = useState<Catalog | null>(null);
+  const [pdfViewer, setPdfViewer]                 = useState<{ url: string; title: string } | null>(null);
+  const [videoViewer, setVideoViewer]             = useState<{ url: string; title: string } | null>(null);
+  const [resolving, setResolving]                 = useState<number | null>(null);
+  const [search, setSearch]                       = useState('');
 
   // Catalogs that have at least one volume
   const catalogsWithContent = useMemo(() =>
     catalogs.filter(c => volumes.some(v => Number(v.catalog_id) === Number(c.id))),
   [catalogs, volumes]);
 
-  const filtered = useMemo(() => {
-    const base = search.trim() ? catalogs : catalogsWithContent;
-    if (!search.trim()) return base;
-    return catalogs.filter(c => c.name.toLowerCase().includes(search.toLowerCase()));
-  }, [catalogs, catalogsWithContent, search]);
+  const uncategorizedCount = useMemo(() =>
+    catalogsWithContent.filter(c => !c.category_id).length,
+  [catalogsWithContent]);
+
+  // Grid catalogs: search overrides folder navigation
+  const gridCatalogs = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (q) {
+      // Search mode: all active catalogs, not just those with content
+      return catalogs.filter(c => c.name.toLowerCase().includes(q));
+    }
+    if (browsedCategoryId === null) return [];
+    if (browsedCategoryId === -1)   return catalogsWithContent;
+    if (browsedCategoryId === 0)    return catalogsWithContent.filter(c => !c.category_id);
+    return catalogsWithContent.filter(c => c.category_id === browsedCategoryId);
+  }, [catalogs, catalogsWithContent, browsedCategoryId, search]);
+
+  const showFolderView = !search.trim() && browsedCategoryId === null;
+
+  const currentCategoryName = useMemo(() => {
+    if (browsedCategoryId === -1) return 'All Catalogs';
+    if (browsedCategoryId === 0)  return 'Uncategorized';
+    return categories.find(c => c.id === browsedCategoryId)?.name || '';
+  }, [browsedCategoryId, categories]);
+
+  // Nav set for the open catalog modal (prev/next within current grid)
+  const navList = useMemo(() =>
+    gridCatalogs.filter(c => volumes.some(v => Number(v.catalog_id) === Number(c.id))),
+  [gridCatalogs, volumes]);
 
   const openContent = async (vol: Volume, type: 'pdf' | 'video') => {
     const rawUrl = type === 'pdf' ? vol.pdf_url : vol.video_url;
@@ -636,36 +730,116 @@ function CatalogScreen({ catalogs, volumes, token, likes, onLike }: {
   return (
     <div className="flex-1 overflow-y-auto custom-scrollbar">
       <div className="p-3 space-y-3">
-        {/* Search */}
+
+        {/* Search bar */}
         <div className="relative">
           <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
           <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search catalogs…"
             className="w-full pl-8 pr-4 py-2 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-sm font-medium focus:ring-2 focus:ring-amber-500/20 focus:border-amber-400 text-zinc-900 dark:text-zinc-100" />
-        </div>
-        {/* 3×3 Grid */}
-        <div className="grid grid-cols-3 gap-2">
-          {filtered.map(cat => (
-            <CatalogCard key={cat.id} catalog={cat}
-              volCount={volumes.filter(v => Number(v.catalog_id) === Number(cat.id)).length}
-              likeCount={likes.counts[cat.id] || 0}
-              likedByMe={likes.likedByMe.has(cat.id)}
-              token={token}
-              onClick={() => setSelectedCatalog(cat)}
-              onLike={onLike}
-            />
-          ))}
-          {filtered.length === 0 && (
-            <div className="col-span-3 text-center text-zinc-400 py-16 text-sm">No catalogs found.</div>
+          {search && (
+            <button onClick={() => setSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400">
+              <X size={13} />
+            </button>
           )}
         </div>
+
+        {/* Breadcrumb / back button when inside a category */}
+        {!search.trim() && browsedCategoryId !== null && (
+          <button onClick={() => setBrowsedCategoryId(null)}
+            className="flex items-center gap-1.5 text-xs font-black text-amber-600 bg-amber-50 dark:bg-amber-900/20 px-3 py-2 rounded-xl w-full">
+            <ChevronLeft size={14} />
+            <span className="truncate">{currentCategoryName}</span>
+            <span className="ml-auto text-amber-400 font-bold">{gridCatalogs.length} catalogs</span>
+          </button>
+        )}
+
+        {/* ── FOLDER VIEW ── */}
+        {showFolderView && (
+          <>
+            {categories.length === 0 && uncategorizedCount === 0 ? (
+              /* No categories at all — show normal 3-col grid directly */
+              <div className="grid grid-cols-3 gap-2">
+                {catalogsWithContent.map(cat => (
+                  <CatalogCard key={cat.id} catalog={cat}
+                    volCount={volumes.filter(v => Number(v.catalog_id) === Number(cat.id)).length}
+                    likeCount={likes.counts[cat.id] || 0}
+                    likedByMe={likes.likedByMe.has(cat.id)}
+                    token={token}
+                    onClick={() => setSelectedCatalog(cat)}
+                    onLike={onLike}
+                  />
+                ))}
+                {catalogsWithContent.length === 0 && (
+                  <div className="col-span-3 text-center text-zinc-400 py-16 text-sm">No catalogs available.</div>
+                )}
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-3">
+                {/* All Catalogs folder */}
+                <FolderTile
+                  name="All Catalogs"
+                  count={catalogsWithContent.length}
+                  coverUrls={catalogsWithContent.slice(0, 4).map(c => c.cover_photo).filter(Boolean) as string[]}
+                  onClick={() => setBrowsedCategoryId(-1)}
+                  token={token}
+                />
+                {/* Named category folders */}
+                {categories.map(cat => {
+                  const catCatalogs = catalogsWithContent.filter(c => c.category_id === cat.id);
+                  return (
+                    <FolderTile
+                      key={cat.id}
+                      name={cat.name}
+                      count={catCatalogs.length}
+                      coverUrls={catCatalogs.slice(0, 4).map(c => c.cover_photo).filter(Boolean) as string[]}
+                      onClick={() => setBrowsedCategoryId(cat.id)}
+                      token={token}
+                    />
+                  );
+                })}
+                {/* Uncategorized folder (only if items exist) */}
+                {uncategorizedCount > 0 && (
+                  <FolderTile
+                    name="Uncategorized"
+                    count={uncategorizedCount}
+                    coverUrls={catalogsWithContent.filter(c => !c.category_id).slice(0, 4).map(c => c.cover_photo).filter(Boolean) as string[]}
+                    onClick={() => setBrowsedCategoryId(0)}
+                    token={token}
+                  />
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── CATALOG GRID VIEW (inside a folder, or search results) ── */}
+        {!showFolderView && (
+          <div className="grid grid-cols-3 gap-2">
+            {gridCatalogs.map(cat => (
+              <CatalogCard key={cat.id} catalog={cat}
+                volCount={volumes.filter(v => Number(v.catalog_id) === Number(cat.id)).length}
+                likeCount={likes.counts[cat.id] || 0}
+                likedByMe={likes.likedByMe.has(cat.id)}
+                token={token}
+                onClick={() => setSelectedCatalog(cat)}
+                onLike={onLike}
+              />
+            ))}
+            {gridCatalogs.length === 0 && (
+              <div className="col-span-3 text-center text-zinc-400 py-16 text-sm">
+                {search.trim() ? 'No catalogs found.' : 'No catalogs in this folder.'}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Catalog modal popup */}
       <AnimatePresence>
         {selectedCatalog && (() => {
-          const navIdx  = catalogsWithContent.findIndex(c => c.id === selectedCatalog.id);
-          const goPrev  = navIdx > 0 ? () => setSelectedCatalog(catalogsWithContent[navIdx - 1]) : undefined;
-          const goNext  = navIdx < catalogsWithContent.length - 1 ? () => setSelectedCatalog(catalogsWithContent[navIdx + 1]) : undefined;
+          const navIdx = navList.findIndex(c => c.id === selectedCatalog.id);
+          const goPrev = navIdx > 0 ? () => setSelectedCatalog(navList[navIdx - 1]) : undefined;
+          const goNext = navIdx < navList.length - 1 ? () => setSelectedCatalog(navList[navIdx + 1]) : undefined;
           return (
             <CatalogModal
               catalog={selectedCatalog} volumes={volumes} token={token}
@@ -697,6 +871,251 @@ function CatalogScreen({ catalogs, volumes, token, likes, onLike }: {
           30%  { opacity: 1; transform: scale(1.3); }
           60%  { opacity: 1; transform: scale(1.0); }
           100% { opacity: 0; transform: scale(1.2); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// ── Tutorial Overlay (first-login animated walkthrough) ──────────────────────
+const TUTORIAL_KEY = 'ap_tutorial_v1';
+
+function TutorialOverlay({ onDone }: { onDone: () => void }) {
+  const [step, setStep] = useState(0);
+  const [dir, setDir]   = useState(1); // 1 = forward, -1 = backward
+
+  const goTo = (next: number) => {
+    setDir(next > step ? 1 : -1);
+    setStep(next);
+  };
+
+  const finish = () => {
+    try { localStorage.setItem(TUTORIAL_KEY, '1'); } catch { /**/ }
+    onDone();
+  };
+
+  // ── Step illustrations ────────────────────────────────────────────────────
+  const Step1 = () => (
+    <div className="flex flex-col items-center gap-5">
+      {/* Mini top-bar mockup */}
+      <div className="w-full max-w-[260px] rounded-2xl overflow-hidden border border-zinc-700 bg-zinc-900 shadow-xl">
+        <div className="flex items-center justify-between px-4 py-3 bg-zinc-900 border-b border-zinc-800">
+          <div>
+            <div className="text-white text-sm font-black">My Orders</div>
+            <div className="text-amber-500 text-[9px] font-black uppercase tracking-widest">Kanika Agents</div>
+          </div>
+          <div className="flex gap-2">
+            {/* Pulsing search icon */}
+            <div className="relative">
+              <div className="w-8 h-8 rounded-xl bg-amber-500 flex items-center justify-center shadow-lg shadow-amber-500/50"
+                style={{ animation: 'tutorialPulse 1.4s ease-in-out infinite' }}>
+                <Search size={14} className="text-white" />
+              </div>
+              <div className="absolute inset-0 rounded-xl bg-amber-400 opacity-40"
+                style={{ animation: 'tutorialRing 1.4s ease-in-out infinite' }} />
+            </div>
+            <div className="w-8 h-8 rounded-xl bg-zinc-800 flex items-center justify-center">
+              <RefreshCw size={13} className="text-zinc-500" />
+            </div>
+          </div>
+        </div>
+        {/* Mock order rows */}
+        <div className="px-3 py-3 space-y-2">
+          {['KAVYA JYOTIKA', 'KAVYA DEEPIKA'].map(name => (
+            <div key={name} className="flex items-center justify-between bg-zinc-800 rounded-xl px-3 py-2">
+              <div>
+                <div className="text-[9px] font-black text-white">{name}</div>
+                <div className="text-[8px] text-zinc-500">Bangalore · 25 May</div>
+              </div>
+              <div className="text-[9px] font-black text-zinc-400">100 pcs</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* Arrow */}
+      <div className="flex flex-col items-end w-full max-w-[260px] -mt-2 pr-6">
+        <div className="text-amber-400 text-lg" style={{ animation: 'tutorialBounceRight 1s ease-in-out infinite' }}>↗</div>
+        <div className="text-[11px] font-bold text-amber-400 text-right">Tap here</div>
+      </div>
+    </div>
+  );
+
+  const Step2 = () => (
+    <div className="w-full max-w-[260px] rounded-2xl overflow-hidden border border-zinc-700 bg-zinc-900 shadow-xl">
+      {/* Search input */}
+      <div className="flex items-center gap-2 px-3 py-2.5 border-b border-zinc-800">
+        <Search size={13} className="text-amber-500 shrink-0" />
+        <span className="text-sm font-medium text-white flex-1">
+          test<span className="animate-pulse">|</span>
+        </span>
+        <X size={11} className="text-zinc-500" />
+      </div>
+      {/* Smart bundle */}
+      <div className="p-2 space-y-2">
+        <div className="flex items-center gap-1.5 px-1">
+          <Sparkles size={9} className="text-amber-400" />
+          <span className="text-[9px] font-black text-amber-500 uppercase tracking-widest">Smart Bundles</span>
+        </div>
+        <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-indigo-900/40 border border-indigo-700/50">
+          <Users size={9} className="text-indigo-400 shrink-0" />
+          <span className="text-[10px] font-black text-indigo-300 flex-1">TEST GARMENTS</span>
+          <span className="bg-indigo-600 text-white text-[8px] px-1.5 py-0.5 rounded-full font-black">2 orders · 200 pcs</span>
+          <ChevronRight size={9} className="text-indigo-400 shrink-0" />
+        </div>
+        {/* Orders section */}
+        <div className="flex items-center gap-1.5 px-1 mt-1">
+          <ClipboardList size={9} className="text-indigo-400" />
+          <span className="text-[9px] font-black text-indigo-400 uppercase tracking-widest">Orders</span>
+        </div>
+        {['102 · Pending', '87 · Pending'].map(sub => (
+          <div key={sub} className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl hover:bg-zinc-800">
+            <div className="w-5 h-5 rounded-md bg-indigo-950 flex items-center justify-center shrink-0">
+              <ClipboardList size={8} className="text-indigo-400" />
+            </div>
+            <div>
+              <div className="text-[9px] font-black text-white">TEST GARMENTS</div>
+              <div className="text-[8px] text-zinc-500">{sub}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  const Step3 = () => (
+    <div className="w-full max-w-[260px] rounded-2xl overflow-hidden border border-zinc-700 bg-zinc-900 shadow-xl">
+      <div className="flex items-center gap-2 px-3 py-2.5 border-b border-zinc-800">
+        <Search size={13} className="text-amber-500 shrink-0" />
+        <span className="text-sm font-medium text-white flex-1">test</span>
+        <X size={11} className="text-zinc-500" />
+      </div>
+      <div className="p-2 space-y-2">
+        <div className="flex items-center gap-1.5 px-1">
+          <Sparkles size={9} className="text-amber-400" />
+          <span className="text-[9px] font-black text-amber-500 uppercase tracking-widest">Smart Bundles</span>
+        </div>
+        {/* Expanded bundle */}
+        <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-indigo-900/40 border border-indigo-700/50 ring-2 ring-indigo-500/40">
+          <Users size={9} className="text-indigo-400 shrink-0" />
+          <span className="text-[10px] font-black text-indigo-300 flex-1">TEST GARMENTS</span>
+          <span className="bg-indigo-600 text-white text-[8px] px-1.5 py-0.5 rounded-full font-black">2 orders · 200 pcs</span>
+          <ChevronRight size={9} className="text-indigo-400 rotate-90 shrink-0" />
+        </div>
+        {/* Pending Orders action — pulsing highlight */}
+        <div className="ml-3 pl-2 border-l-2 border-zinc-700">
+          <div className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg border border-indigo-500 bg-indigo-900/50 w-fit"
+            style={{ animation: 'tutorialPulse 1.2s ease-in-out infinite', boxShadow: '0 0 12px rgba(99,102,241,0.5)' }}>
+            <ClipboardList size={9} className="text-indigo-300 shrink-0" />
+            <span className="text-[10px] font-black text-indigo-300">Pending Orders</span>
+          </div>
+        </div>
+        <div className="text-center text-[9px] text-amber-400 font-bold pt-1">↑ Tap to jump to filtered orders</div>
+      </div>
+    </div>
+  );
+
+  const steps = [
+    {
+      title: 'Use Universal Search',
+      subtitle: 'Tap the 🔍 icon at the top right of any screen to open the search panel.',
+      illustration: <Step1 />,
+    },
+    {
+      title: 'Type Any Name',
+      subtitle: 'Search by customer name or catalog name. Results appear instantly across orders and parties.',
+      illustration: <Step2 />,
+    },
+    {
+      title: 'Smart Bundles',
+      subtitle: 'Tap a Smart Bundle card, then "Pending Orders" to jump straight to that customer\'s orders.',
+      illustration: <Step3 />,
+    },
+  ];
+
+  const current = steps[step];
+
+  return (
+    <div className="fixed inset-0 z-[300] flex items-end justify-center bg-black/70 backdrop-blur-sm">
+      <motion.div
+        initial={{ y: 80, opacity: 0 }}
+        animate={{ y: 0, opacity: 1 }}
+        exit={{ y: 80, opacity: 0 }}
+        transition={{ type: 'spring', stiffness: 340, damping: 30 }}
+        className="w-full max-w-md bg-zinc-950 rounded-t-[2.5rem] border-t border-zinc-800 overflow-hidden"
+        style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 24px)' }}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 pt-5 pb-2">
+          <div className="flex gap-1.5">
+            {steps.map((_, i) => (
+              <div key={i} className={`h-1.5 rounded-full transition-all duration-300 ${i === step ? 'w-6 bg-amber-500' : 'w-1.5 bg-zinc-700'}`} />
+            ))}
+          </div>
+          <button onClick={finish} className="text-[11px] font-bold text-zinc-500 hover:text-zinc-300 px-2 py-1">
+            Skip
+          </button>
+        </div>
+
+        {/* Illustration */}
+        <div className="px-6 py-4 flex justify-center overflow-hidden">
+          <AnimatePresence mode="wait" custom={dir}>
+            <motion.div key={step}
+              custom={dir}
+              initial={{ x: dir * 60, opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: dir * -60, opacity: 0 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 32 }}
+              className="w-full flex justify-center"
+            >
+              {current.illustration}
+            </motion.div>
+          </AnimatePresence>
+        </div>
+
+        {/* Text */}
+        <div className="px-6 pb-5">
+          <AnimatePresence mode="wait">
+            <motion.div key={`text-${step}`}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.2 }}
+            >
+              <h3 className="text-lg font-black text-white mb-1">{current.title}</h3>
+              <p className="text-sm text-zinc-400 leading-relaxed">{current.subtitle}</p>
+            </motion.div>
+          </AnimatePresence>
+        </div>
+
+        {/* Navigation */}
+        <div className="px-6 flex gap-3">
+          {step > 0 && (
+            <button onClick={() => goTo(step - 1)}
+              className="flex-1 py-3 rounded-2xl border border-zinc-700 text-zinc-400 font-black text-sm">
+              Back
+            </button>
+          )}
+          <button
+            onClick={() => step < steps.length - 1 ? goTo(step + 1) : finish()}
+            className="flex-1 py-3 rounded-2xl bg-amber-500 text-white font-black text-sm shadow-lg shadow-amber-500/30">
+            {step < steps.length - 1 ? 'Next →' : 'Got it!'}
+          </button>
+        </div>
+      </motion.div>
+
+      {/* keyframes */}
+      <style>{`
+        @keyframes tutorialPulse {
+          0%, 100% { transform: scale(1); }
+          50%       { transform: scale(1.08); }
+        }
+        @keyframes tutorialRing {
+          0%   { transform: scale(1);   opacity: 0.5; }
+          100% { transform: scale(1.8); opacity: 0; }
+        }
+        @keyframes tutorialBounceRight {
+          0%, 100% { transform: translateX(0); }
+          50%       { transform: translateX(4px); }
         }
       `}</style>
     </div>
@@ -930,11 +1349,11 @@ function GlobalSearch({
 function OrdersScreen({ orders, customers, filterPreset }: {
   orders: Order[]; customers: Customer[]; filterPreset?: FilterPreset;
 }) {
-  const [statusTab, setStatusTab]   = useState<'pending' | 'delivered'>('pending');
-  const [filterMode, setFilterMode] = useState<OrderFilterMode>('party');
-  const [search, setSearch]         = useState('');
+  const [statusTab, setStatusTab]         = useState<'pending' | 'delivered'>('pending');
+  const [filterMode, setFilterMode]       = useState<OrderFilterMode>('party');
   const [filterParty, setFilterParty]     = useState('');
   const [filterCatalog, setFilterCatalog] = useState('');
+  const [search, setSearch]               = useState('');
 
   // Apply external filter preset when it changes (from GlobalSearch)
   useEffect(() => {
@@ -959,12 +1378,6 @@ function OrdersScreen({ orders, customers, filterPreset }: {
       return true;
     });
   }, [orders, statusTab, search, filterParty, filterCatalog]);
-
-  const catalogOptions = useMemo(() => {
-    const names = new Set<string>();
-    orders.forEach(o => o.items.forEach(i => { if (i.catalog_name) names.add(i.catalog_name); }));
-    return [...names].sort();
-  }, [orders]);
 
   const pendingCount   = useMemo(() => orders.filter(o => o.status !== 'Delivered').length, [orders]);
   const deliveredCount = useMemo(() => orders.filter(o => o.status === 'Delivered').length, [orders]);
@@ -996,51 +1409,50 @@ function OrdersScreen({ orders, customers, filterPreset }: {
   return (
     <div className="flex-1 overflow-y-auto custom-scrollbar">
       <div className="p-4 space-y-3">
-        {/* Status tabs */}
-        <div className="flex gap-2">
+        {/* Status + view-mode tabs — compact single row each */}
+        <div className="flex gap-1.5">
           <button onClick={() => setStatusTab('pending')}
-            className={`flex-1 py-2.5 rounded-xl font-black text-sm transition-colors ${statusTab === 'pending' ? 'bg-orange-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
+            className={`flex-1 py-1.5 rounded-xl font-black text-xs transition-colors ${statusTab === 'pending' ? 'bg-orange-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
             Pending ({pendingCount})
           </button>
           <button onClick={() => setStatusTab('delivered')}
-            className={`flex-1 py-2.5 rounded-xl font-black text-sm transition-colors ${statusTab === 'delivered' ? 'bg-emerald-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
+            className={`flex-1 py-1.5 rounded-xl font-black text-xs transition-colors ${statusTab === 'delivered' ? 'bg-emerald-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
             Delivered ({deliveredCount})
           </button>
         </div>
-
-        {/* View mode tabs — full width like Pending/Delivered */}
-        <div className="flex gap-2">
+        <div className="flex gap-1.5">
           <button onClick={() => setFilterMode('party')}
-            className={`flex-1 py-2.5 rounded-xl font-black text-sm transition-colors flex items-center justify-center gap-1.5 ${filterMode === 'party' ? 'bg-amber-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
-            <Users size={13} /> Party-wise
+            className={`flex-1 py-1.5 rounded-xl font-black text-xs transition-colors flex items-center justify-center gap-1 ${filterMode === 'party' ? 'bg-amber-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
+            <Users size={11} /> Party-wise
           </button>
           <button onClick={() => setFilterMode('catalog')}
-            className={`flex-1 py-2.5 rounded-xl font-black text-sm transition-colors flex items-center justify-center gap-1.5 ${filterMode === 'catalog' ? 'bg-amber-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
-            <Tag size={13} /> Catalog-wise
+            className={`flex-1 py-1.5 rounded-xl font-black text-xs transition-colors flex items-center justify-center gap-1 ${filterMode === 'catalog' ? 'bg-amber-500 text-white' : 'bg-white dark:bg-zinc-900 text-zinc-500 border border-zinc-200 dark:border-zinc-700'}`}>
+            <Tag size={11} /> Catalog-wise
           </button>
         </div>
 
-        {/* Search */}
-        <div className="relative">
-          <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
-          <input type="text" value={search} onChange={e => setSearch(e.target.value)} placeholder="Search orders…"
-            className="w-full pl-8 pr-3 py-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-xs font-medium focus:ring-2 focus:ring-amber-500/20 focus:border-amber-400 text-zinc-900 dark:text-zinc-100" />
-        </div>
-
-        {/* Party / Catalog filter dropdown */}
-        {filterMode === 'party' && (
-          <select value={filterParty} onChange={e => setFilterParty(e.target.value)}
-            className="w-full py-2.5 px-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-xs font-medium text-zinc-700 dark:text-zinc-300 focus:ring-2 focus:ring-amber-500/20">
-            <option value="">All Parties</option>
-            {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-        )}
-        {filterMode === 'catalog' && (
-          <select value={filterCatalog} onChange={e => setFilterCatalog(e.target.value)}
-            className="w-full py-2.5 px-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-xs font-medium text-zinc-700 dark:text-zinc-300 focus:ring-2 focus:ring-amber-500/20">
-            <option value="">All Catalogs</option>
-            {catalogOptions.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
+        {/* Active filter chip / search hint */}
+        {(filterParty || filterCatalog || search) ? (
+          <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl">
+            <Search size={12} className="text-amber-500 shrink-0" />
+            <span className="text-[11px] font-bold text-amber-700 dark:text-amber-400 flex-1 truncate">
+              {filterParty
+                ? `Party: ${customers.find(c => String(c.id) === filterParty)?.name || filterParty}`
+                : filterCatalog
+                  ? `Catalog: ${filterCatalog}`
+                  : `Search: "${search}"`}
+            </span>
+            <button
+              onClick={() => { setSearch(''); setFilterParty(''); setFilterCatalog(''); }}
+              className="shrink-0 w-5 h-5 rounded-full bg-amber-200 dark:bg-amber-700 flex items-center justify-center active:scale-90 transition-transform"
+            >
+              <X size={10} className="text-amber-700 dark:text-amber-200" />
+            </button>
+          </div>
+        ) : (
+          <p className="text-[11px] text-zinc-400 text-center">
+            Use search bar to search order details for a customer or a catalog.
+          </p>
         )}
 
         {/* Order groups */}
@@ -1055,8 +1467,7 @@ function OrdersScreen({ orders, customers, filterPreset }: {
             </div>
             <div className="space-y-2">
               {groupOrders.map(o => (
-                <OrderCard key={o.id} order={o}
-                  highlight={filterMode === 'catalog' ? o.customer_name : undefined} />
+                <OrderCard key={o.id} order={o} mode={filterMode} />
               ))}
             </div>
           </div>
@@ -1097,7 +1508,9 @@ function DashboardScreen({ session, customers, orders, catalogs, onTabChange }: 
           }} />
           <p className="text-white/80 text-xs font-bold uppercase tracking-widest">Welcome back</p>
           <h2 className="text-white text-2xl font-black mt-0.5">{session.name}</h2>
-          <p className="text-white/70 text-xs mt-1 font-medium">{session.role} · Kanika Agents</p>
+          <p className="text-white/70 text-xs mt-1 font-medium">
+            {session.role}{session.agentPermissionName ? ` · ${session.agentPermissionName}` : ''}
+          </p>
         </div>
 
         {/* Stats row 1 */}
@@ -1182,7 +1595,14 @@ function ProfileScreen({ session, onLogout, showToast }: {
         </div>
         <h2 className="text-white text-xl font-black">{session.name}</h2>
         <p className="text-white/80 text-xs font-bold mt-0.5">{session.email}</p>
-        <span className="inline-block mt-2 px-3 py-1 bg-white/20 rounded-full text-white text-[10px] font-black uppercase tracking-widest">{session.role}</span>
+        <div className="flex flex-wrap gap-2 mt-2">
+          <span className="px-3 py-1 bg-white/20 rounded-full text-white text-[10px] font-black uppercase tracking-widest">{session.role}</span>
+          {session.agentPermissionName && (
+            <span className="px-3 py-1 bg-white/30 rounded-full text-white text-[10px] font-black uppercase tracking-widest">
+              🏢 {session.agentPermissionName}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Change PIN */}
@@ -1281,15 +1701,19 @@ export default function App() {
   void dark;
 
   // Data state
-  const [customers, setCustomers] = useState<Customer[]>([]);
-  const [orders, setOrders]       = useState<Order[]>([]);
-  const [catalogs, setCatalogs]   = useState<Catalog[]>([]);
-  const [volumes, setVolumes]     = useState<Volume[]>([]);
-  const [likes, setLikes]         = useState<LikeData>({ counts: {}, likedByMe: new Set() });
-  const [loading, setLoading]     = useState(false);
-  const [loadError, setLoadError] = useState('');
-  const [agentId, setAgentId]     = useState<number | null>(null);
+  const [customers, setCustomers]               = useState<Customer[]>([]);
+  const [orders, setOrders]                     = useState<Order[]>([]);
+  const [catalogs, setCatalogs]                 = useState<Catalog[]>([]);
+  const [catalogCategories, setCatalogCategories] = useState<CatalogCategory[]>([]);
+  const [volumes, setVolumes]                   = useState<Volume[]>([]);
+  const [likes, setLikes]                       = useState<LikeData>({ counts: {}, likedByMe: new Set() });
+  const [loading, setLoading]                   = useState(false);
+  const [loadError, setLoadError]               = useState('');
+  const [agentId, setAgentId]                   = useState<number | null>(null);
   const pendingLikes              = useRef<Set<number>>(new Set());
+
+  // Tutorial state — show once after first login
+  const [showTutorial, setShowTutorial] = useState(false);
 
   // Global search state
   const [gsOpen, setGsOpen]             = useState(false);
@@ -1304,6 +1728,8 @@ export default function App() {
   useEffect(() => {
     const saved = loadSession();
     if (!saved) return;
+    // Show tutorial if not yet seen (covers fresh installs with cached session)
+    try { if (!localStorage.getItem(TUTORIAL_KEY)) setShowTutorial(true); } catch { /**/ }
     // Check expiry locally first — no network call for a valid unexpired JWT
     if (!jwtIsExpired(saved.accessToken)) { setSession(saved); return; }
     // Expired — try to silently refresh before showing login
@@ -1386,49 +1812,85 @@ export default function App() {
       // If Owner/Admin, show everything regardless of agent mapping
       const isAdmin = ['Owner', 'Admin', 'LazyAdmin'].includes(sess.role);
 
-      // Resolve agentId:
-      //   1. Already cached in session from a prior load
-      //   2. Look up by agentPermissionName (from app_user_permissions type='agent')
-      //   3. Fall back to display name match (legacy / testagent-style accounts)
-      //   4. Admins/Owner skip entirely
+      // ── Resolve agentPermissionName ───────────────────────────────────────────
+      // login_with_pin now returns permissions inline, but cached sessions
+      // (saved before that fix) may not have agentPermissionName.
+      // Fall back to the ap_get_agent_name SECURITY DEFINER RPC.
+      let permName = sess.agentPermissionName;
+      if (!permName && !isAdmin) {
+        permName = await fetchAgentNameFromDb(sess.email, sess.accessToken) || undefined;
+        if (permName) {
+          // Persist so subsequent loads skip the RPC call
+          const updated = { ...sess, agentPermissionName: permName };
+          saveSession(updated);
+          setSession(updated);
+        }
+      }
+
+      // ── Resolve agentId ───────────────────────────────────────────────────────
+      // Priority: cached agentId → look up by permName → look up by display name
       let resolvedAgentId = sess.agentId || null;
       if (!resolvedAgentId && !isAdmin) {
-        const lookupName = sess.agentPermissionName || sess.name;
+        const lookupName = permName || sess.name;
         resolvedAgentId = await fetchAgentId(lookupName, sess.accessToken);
         if (resolvedAgentId) {
-          const updated = { ...sess, agentId: resolvedAgentId };
+          const updated = { ...sess, agentId: resolvedAgentId, agentPermissionName: permName };
           saveSession(updated);
+          setSession(updated);
         }
       }
       setAgentId(resolvedAgentId);
 
-      // Fetch customers
-      let myCustomers: Customer[] = [];
-      if (resolvedAgentId) {
-        myCustomers = await fetchMyCustomers(resolvedAgentId, sess.accessToken);
-      } else if (isAdmin) {
-        myCustomers = await fetchMyCustomers(-1, sess.accessToken).catch(() => []);
-      }
-      // Note: if Agent role but no agentId resolved → myCustomers stays [] → no data shown.
-      // Fix the account in the main app by setting app_users.agent_id.
-      setCustomers(myCustomers);
-
-      const customerIds = myCustomers.map(c => c.id);
-      // Fetch orders, catalogs, volumes, likes in parallel
-      // Owner/Admin: fetchAll=true avoids building a massive customer_id=in.(...) URL
-      const [rawOrders, cats, vols, lks] = await Promise.all([
-        fetchMyOrders(customerIds, sess.accessToken, isAdmin),
+      // ── Fetch everything in parallel ──────────────────────────────────────────
+      // Orders filter directly by orders.agent_id — no customer lookup needed.
+      // For agents: "My Parties" is derived from order customer data (customers.agent_id
+      // is not populated in the DB so a direct query always returns 0).
+      // For admin/owner: fetch all customers separately.
+      const orderAgentId = isAdmin ? null : resolvedAgentId;
+      const [adminCustomers, rawOrders, cats, vols, lks] = await Promise.all([
+        isAdmin
+          ? fetchMyCustomers(-1, sess.accessToken).catch(() => [] as Customer[])
+          : Promise.resolve([] as Customer[]),
+        fetchOrdersByAgent(orderAgentId, sess.accessToken),
         fetchCatalogs(sess.accessToken),
         fetchVolumes(sess.accessToken),
         fetchLikes(sess.email, sess.accessToken),
       ]);
 
-      // Enrich orders with volume/catalog names
-      const enriched = await enrichWithVolumes(rawOrders, sess.accessToken);
-      setOrders(enriched);
+      // Derive unique customers from order data for agents
+      // (avoids the customers.agent_id = NULL problem)
+      let resolvedCustomers: Customer[];
+      if (isAdmin) {
+        resolvedCustomers = adminCustomers;
+      } else {
+        const customerMap = new Map<number, Customer>();
+        rawOrders.forEach(o => {
+          if (o.customer_id && !customerMap.has(o.customer_id)) {
+            customerMap.set(o.customer_id, { id: o.customer_id, name: o.customer_name, city_name: o.city_name });
+          }
+        });
+        resolvedCustomers = [...customerMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+      }
+      setCustomers(resolvedCustomers);
       setCatalogs(cats);
       setVolumes(vols);
       setLikes(lks);
+
+      // Derive unique catalog categories from the fetched catalog rows
+      const seenCatIds = new Set<number>();
+      const uniqueCategories: CatalogCategory[] = [];
+      cats.forEach(c => {
+        if (c.category_id && !seenCatIds.has(c.category_id)) {
+          seenCatIds.add(c.category_id);
+          uniqueCategories.push({ id: c.category_id, name: c.category_name || `Category ${c.category_id}` });
+        }
+      });
+      uniqueCategories.sort((a, b) => a.name.localeCompare(b.name));
+      setCatalogCategories(uniqueCategories);
+
+      // Enrich orders with volume/catalog names
+      const enriched = await enrichWithVolumes(rawOrders, sess.accessToken);
+      setOrders(enriched);
 
       // Batch-sign all catalog cover images so Android WebView doesn't hit its
       // connection-concurrency limit loading 9+ thumbnails simultaneously.
@@ -1445,14 +1907,18 @@ export default function App() {
 
   const handleLogin = (sess: APSession) => {
     setSession(sess);
-    if (sess.isFirstLogin) { setShowChangePinScreen(true); }
+    if (sess.isFirstLogin) { setShowChangePinScreen(true); return; }
+    // Show tutorial once per device
+    try {
+      if (!localStorage.getItem(TUTORIAL_KEY)) setShowTutorial(true);
+    } catch { /**/ }
   };
 
   const handleLogout = () => {
     stopRealtimeSync();
     clearSession();
     setSession(null);
-    setCustomers([]); setOrders([]); setCatalogs([]); setVolumes([]);
+    setCustomers([]); setOrders([]); setCatalogs([]); setCatalogCategories([]); setVolumes([]);
     setLikes({ counts: {}, likedByMe: new Set() });
     setActiveTab('home');
   };
@@ -1575,7 +2041,7 @@ export default function App() {
             <OrdersScreen orders={orders} customers={customers} filterPreset={orderPreset} />
           </div>
           <div className={`flex-1 flex flex-col min-h-0 overflow-hidden ${activeTab === 'catalogs' ? '' : 'hidden'}`}>
-            <CatalogScreen catalogs={catalogs} volumes={volumes} token={session.accessToken} likes={likes} onLike={handleLike} />
+            <CatalogScreen catalogs={catalogs} volumes={volumes} token={session.accessToken} likes={likes} onLike={handleLike} categories={catalogCategories} />
           </div>
           <div className={`flex-1 flex flex-col min-h-0 overflow-hidden ${activeTab === 'profile' ? '' : 'hidden'}`}>
             <ProfileScreen session={session} onLogout={handleLogout} showToast={showToast} />
@@ -1585,6 +2051,11 @@ export default function App() {
 
       {/* Bottom nav */}
       <BottomNav active={activeTab} onChange={setActiveTab} pendingCount={pendingCount} />
+
+      {/* Tutorial overlay — shown once on first login */}
+      <AnimatePresence>
+        {showTutorial && <TutorialOverlay onDone={() => setShowTutorial(false)} />}
+      </AnimatePresence>
 
       {/* Global Search overlay */}
       <GlobalSearch

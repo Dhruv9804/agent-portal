@@ -226,26 +226,34 @@ export async function apLogin(email: string, pin: string): Promise<{
   const gotrueFlagSet = store.get(flagKey);
 
   // JWT acquisition (fast: GoTrue direct, slow: ensure-user-session)
+  // Fast path: GoTrue password login (works instantly when GoTrue account exists)
   const getJwtFast = async () => {
     try {
       const ac = new AbortController();
-      const t  = setTimeout(() => ac.abort(), 8000);
+      const t  = setTimeout(() => ac.abort(), 10000);
       const r = await window.fetch(`${PROXY_URL}/auth/v1/token?grant_type=password`, {
         method: 'POST', headers: baseHeaders(),
         body: JSON.stringify({ email: cleanEmail, password: `${authToken}_ssp` }),
         signal: ac.signal,
       });
       clearTimeout(t);
-      if (r.ok) { const d = await r.json(); if (d.access_token) return { access: d.access_token, refresh: d.refresh_token || '' }; }
+      if (r.ok) {
+        const d = await r.json();
+        if (d.access_token) {
+          store.set(flagKey, '1'); // GoTrue account confirmed — skip slow path next time
+          return { access: d.access_token, refresh: d.refresh_token || '' };
+        }
+      }
       if ([400, 401, 422].includes(r.status)) { store.remove(flagKey); }
     } catch { /* fall through */ }
     return null;
   };
 
-  const getJwtSlow = async () => {
+  // Slow path: Edge Function provisions GoTrue account on first login, then returns JWT
+  const getJwtSlow = async (timeoutMs = 35000) => {
     try {
       const ac = new AbortController();
-      const t  = setTimeout(() => ac.abort(), 20000);
+      const t  = setTimeout(() => ac.abort(), timeoutMs);
       const r = await window.fetch(`${PROXY_URL}/functions/v1/ensure-user-session`, {
         method: 'POST', headers: baseHeaders(),
         body: JSON.stringify({ email: cleanEmail, pin: authToken }),
@@ -263,6 +271,21 @@ export async function apLogin(email: string, pin: string): Promise<{
     return null;
   };
 
+  // Race fast and slow in parallel — take whichever returns a valid JWT first.
+  // Fast wins on repeat logins (GoTrue account exists).
+  // Slow wins on first login (provisions GoTrue account then returns JWT).
+  // If both fail (Edge Function cold-start timeout), retry slow once with extra time.
+  const raceJwt = (): Promise<{ access: string; refresh: string } | null> =>
+    new Promise(resolve => {
+      let done = false; let pending = 2;
+      const tryResolve = (r: { access: string; refresh: string } | null) => {
+        if (r && !done) { done = true; resolve(r); return; }
+        if (--pending === 0 && !done) resolve(null);
+      };
+      getJwtFast().then(tryResolve).catch(() => tryResolve(null));
+      getJwtSlow().then(tryResolve).catch(() => tryResolve(null));
+    });
+
   // Device check for agents (5-device limit)
   const devicePromise = user.role === 'Agent'
     ? apFetch(`/rest/v1/rpc/cv_check_agent_device`, {
@@ -271,11 +294,16 @@ export async function apLogin(email: string, pin: string): Promise<{
       }, 10000)
     : Promise.resolve(new Response('{}', { status: 200 }));
 
-  const jwtPromise = gotrueFlagSet === '1'
-    ? getJwtFast().then(r => r ?? getJwtSlow())
-    : getJwtSlow();
+  // Run device check and JWT race in parallel
+  const jwtPromise = raceJwt().then(r => r ?? getJwtSlow(40000)); // one retry with longer timeout if race fails
 
-  const [deviceRes, jwtResult] = await Promise.all([devicePromise, jwtPromise]);
+  let deviceRes: Response;
+  let jwtResult: { access: string; refresh: string } | null;
+  try {
+    [deviceRes, jwtResult] = await Promise.all([devicePromise, jwtPromise]);
+  } catch {
+    return { error: 'Network error. Check your connection and try again.' };
+  }
 
   if (user.role === 'Agent') {
     const deviceData = await deviceRes.json().catch(() => ({}));
@@ -290,11 +318,12 @@ export async function apLogin(email: string, pin: string): Promise<{
 
   if (!jwtResult?.access) return { error: 'Could not establish session. Please try again.' };
 
-  // Extract agent name from permissions array (type='agent') if present.
-  // This is the name used in the `agents` table and is the correct lookup key.
-  const agentPerm = Array.isArray(user.permissions)
-    ? (user.permissions as { type: string; value: string }[]).find(p => p.type === 'agent')
-    : undefined;
+  // login_with_pin is SECURITY DEFINER and already returns the full
+  // app_user_permissions array as `permissions: [{type,value,...}]`.
+  // Read directly — no extra network call, no RLS exposure.
+  const permsFromLogin: { type: string; value: string }[] =
+    Array.isArray(user.permissions) ? user.permissions : [];
+  const agentPerm = permsFromLogin.find(p => p.type === 'agent');
 
   const session: APSession = {
     email:               cleanEmail,
@@ -333,14 +362,32 @@ export interface Challan {
   id: number; challan_number: string; order_id: number; customer_id: number;
   customer_name: string; created_at: string; bale_number: string;
 }
-export interface Catalog  { id: number; name: string; cover_photo?: string; thumbnail?: string; is_active: number; is_pinned?: boolean; }
+export interface CatalogCategory { id: number; name: string; }
+export interface Catalog  { id: number; name: string; cover_photo?: string; thumbnail?: string; is_active: number; is_pinned?: boolean; category_id?: number; category_name?: string; }
 export interface LikeData { counts: Record<number, number>; likedByMe: Set<number>; }
 export interface Volume   { id: number; catalog_id: number; volume_name: string; pdf_url?: string; video_url?: string; catalogs?: { name: string }; }
+
+// ── Resolve agent name from DB (SECURITY DEFINER RPC — bypasses RLS) ──────────
+// Call this when the session was cached before agentPermissionName was stored.
+// SQL to create this function is in the session notes.
+export async function fetchAgentNameFromDb(email: string, token: string): Promise<string | null> {
+  try {
+    const res = await apFetch('/rest/v1/rpc/ap_get_agent_name', {
+      method: 'POST',
+      body: JSON.stringify({ p_email: email }),
+    }, 10000, token);
+    if (!res.ok) return null;
+    const val = await res.json();
+    // PostgREST returns a scalar as a plain value (string or null)
+    return typeof val === 'string' ? val : null;
+  } catch { return null; }
+}
 
 // ── Resolve agent ID from name ─────────────────────────────────────────────────
 export async function fetchAgentId(name: string, token: string): Promise<number | null> {
   try {
-    const res = await apFetch(`/rest/v1/agents?select=id,name&name=eq.${encodeURIComponent(name)}&limit=1`, {}, 10000, token);
+    // Use ilike for case-insensitive match — agent names may vary in case
+    const res = await apFetch(`/rest/v1/agents?select=id,name&name=ilike.${encodeURIComponent(name)}&limit=1`, {}, 10000, token);
     const rows = res.ok ? await res.json() : [];
     return rows[0]?.id ?? null;
   } catch { return null; }
@@ -369,84 +416,58 @@ export async function fetchMyCustomers(agentId: number, token: string): Promise<
   return all;
 }
 
-// ── Fetch orders ───────────────────────────────────────────────────────────────
-// Pass fetchAll=true for Owner/Admin (no customer_id filter — avoids huge URL).
-// Otherwise pass customerIds and it filters by customer_id=in.(...).
-// Chunks large ID lists into batches of 200 to stay within URL length limits.
-export async function fetchMyOrders(
-  customerIds: number[],
+// ── Shared row parser ─────────────────────────────────────────────────────────
+function parseOrderRows(rows: any[]): Order[] {
+  return rows.map(r => {
+    const items: OrderItem[] = (r.order_items || []).map((i: any) => ({
+      id: i.id, volume_id: i.volume_id, size: i.size,
+      quantity: i.quantity, rate: i.rate, amount: i.amount,
+    }));
+    const total = items.reduce((s, i) => s + (i.amount ?? (i.rate * i.quantity)), 0);
+    return {
+      id: r.id, order_number: r.order_number || `#${r.id}`,
+      customer_id: r.customer_id,
+      customer_name: r.customers?.name || '',
+      city_name: r.customers?.cities?.name || '',
+      status: r.status || 'Pending',
+      created_at: r.created_at, remarks: r.remarks || '',
+      items, total_amount: total,
+    };
+  });
+}
+
+// ── Fetch orders by agent_id (direct column on orders table) ──────────────────
+// Orders have an agent_id FK directly — no need to go through customers at all.
+// Owner/Admin (agentId=null): fetches all orders without filter.
+export async function fetchOrdersByAgent(
+  agentId: number | null,
   token: string,
-  fetchAll = false,
 ): Promise<Order[]> {
-  if (!fetchAll && !customerIds.length) return [];
-
   const SELECT = 'id,order_number,customer_id,status,created_at,remarks,customers(name,cities(name)),order_items(id,volume_id,size,quantity,rate,amount)';
-  const PAGE = 1000;
+  const PAGE   = 1000;
+  const filter = agentId ? `&agent_id=eq.${agentId}` : '';
 
-  const parseRows = (rows: any[]): Order[] =>
-    rows.map(r => {
-      const items: OrderItem[] = (r.order_items || []).map((i: any) => ({
-        id: i.id, volume_id: i.volume_id, size: i.size,
-        quantity: i.quantity, rate: i.rate, amount: i.amount,
-      }));
-      const total = items.reduce((s, i) => s + (i.amount ?? (i.rate * i.quantity)), 0);
-      return {
-        id: r.id, order_number: r.order_number || `#${r.id}`,
-        customer_id: r.customer_id,
-        customer_name: r.customers?.name || '',
-        city_name: r.customers?.cities?.name || '',
-        status: r.status || 'Pending',
-        created_at: r.created_at, remarks: r.remarks || '',
-        items, total_amount: total,
-      };
-    });
-
-  // Owner/Admin path — no customer filter, paginate through all orders
-  if (fetchAll) {
-    const all: Order[] = [];
-    let offset = 0;
-    while (true) {
-      try {
-        const res = await apFetch(
-          `/rest/v1/orders?select=${SELECT}&order=id.desc&limit=${PAGE}&offset=${offset}`,
-          {}, 30000, token
-        );
-        if (!res.ok) break;
-        const rows: any[] = await res.json();
-        all.push(...parseRows(rows));
-        if (rows.length < PAGE) break;
-        offset += PAGE;
-      } catch { break; }
-    }
-    return all;
+  const all: Order[] = [];
+  let offset = 0;
+  while (true) {
+    try {
+      const res = await apFetch(
+        `/rest/v1/orders?select=${SELECT}${filter}&order=id.desc&limit=${PAGE}&offset=${offset}`,
+        {}, 30000, token
+      );
+      if (!res.ok) break;
+      const rows: any[] = await res.json();
+      all.push(...parseOrderRows(rows));
+      if (rows.length < PAGE) break;
+      offset += PAGE;
+    } catch { break; }
   }
+  return all;
+}
 
-  // Agent path — filter by customer IDs, chunk to avoid URL length limits
-  const CHUNK = 200;
-  const chunks: number[][] = [];
-  for (let i = 0; i < customerIds.length; i += CHUNK) chunks.push(customerIds.slice(i, i + CHUNK));
-
-  const results = await Promise.all(chunks.map(async chunk => {
-    const chunkOrders: Order[] = [];
-    let offset = 0;
-    while (true) {
-      try {
-        const res = await apFetch(
-          `/rest/v1/orders?select=${SELECT}&customer_id=in.(${chunk.join(',')})&order=id.desc&limit=${PAGE}&offset=${offset}`,
-          {}, 30000, token
-        );
-        if (!res.ok) break;
-        const rows: any[] = await res.json();
-        chunkOrders.push(...parseRows(rows));
-        if (rows.length < PAGE) break;
-        offset += PAGE;
-      } catch { break; }
-    }
-    return chunkOrders;
-  }));
-
-  // Merge chunks and sort by id desc
-  return results.flat().sort((a, b) => b.id - a.id);
+// kept for backward compat
+export async function fetchMyOrders(customerIds: number[], token: string, fetchAll = false): Promise<Order[]> {
+  return fetchOrdersByAgent(fetchAll ? null : null, token);
 }
 
 // ── Enrich order items with volume/catalog names ───────────────────────────────
@@ -506,10 +527,18 @@ export async function fetchMyChallans(customerIds: number[], token: string): Pro
 // ── Fetch catalogs + volumes ──────────────────────────────────────────────────
 export async function fetchCatalogs(token: string): Promise<Catalog[]> {
   try {
-    const res = await apFetch(`/rest/v1/catalogs?select=id,name,cover_photo,is_active,is_pinned&is_active=eq.1&order=is_pinned.desc,id.desc&limit=500`, {}, 15000, token);
+    const res = await apFetch(
+      `/rest/v1/catalogs?select=id,name,cover_photo,is_active,is_pinned,category_id,catalog_categories(name)&is_active=eq.1&order=is_pinned.desc,id.desc&limit=500`,
+      {}, 15000, token
+    );
     if (!res.ok) return [];
     const rows: any[] = await res.json();
-    return rows.map(r => ({ id: r.id, name: r.name, cover_photo: r.cover_photo, is_active: r.is_active, is_pinned: !!r.is_pinned }));
+    return rows.map(r => ({
+      id: r.id, name: r.name, cover_photo: r.cover_photo,
+      is_active: r.is_active, is_pinned: !!r.is_pinned,
+      category_id:   r.category_id   ?? undefined,
+      category_name: r.catalog_categories?.name ?? undefined,
+    }));
   } catch { return []; }
 }
 
