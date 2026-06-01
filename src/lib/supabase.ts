@@ -271,20 +271,30 @@ export async function apLogin(email: string, pin: string): Promise<{
     return null;
   };
 
-  // Race fast and slow in parallel — take whichever returns a valid JWT first.
-  // Fast wins on repeat logins (GoTrue account exists).
-  // Slow wins on first login (provisions GoTrue account then returns JWT).
-  // If both fail (Edge Function cold-start timeout), retry slow once with extra time.
-  const raceJwt = (): Promise<{ access: string; refresh: string } | null> =>
-    new Promise(resolve => {
-      let done = false; let pending = 2;
-      const tryResolve = (r: { access: string; refresh: string } | null) => {
-        if (r && !done) { done = true; resolve(r); return; }
-        if (--pending === 0 && !done) resolve(null);
-      };
-      getJwtFast().then(tryResolve).catch(() => tryResolve(null));
-      getJwtSlow().then(tryResolve).catch(() => tryResolve(null));
+  // Resolve to the first promise that yields a non-null token; null if all do.
+  const firstValid = (promises: Promise<{ access: string; refresh: string } | null>[]) =>
+    new Promise<{ access: string; refresh: string } | null>(resolve => {
+      let remaining = promises.length, done = false;
+      promises.forEach(p => p.then(v => {
+        if (done) return;
+        if (v) { done = true; resolve(v); }
+        else if (--remaining === 0) resolve(null);
+      }).catch(() => { if (!done && --remaining === 0) resolve(null); }));
     });
+
+  // Bounded parallel race: fire fast path; if no valid token in 600ms, start the slow
+  // edge-function path in parallel and take whichever returns first. Repeat logins win on
+  // fast (~200ms) and never fire slow — saves an Edge Function call per login. First login
+  // (no GoTrue account yet): fast 400s quickly → slow provisions the account then returns.
+  const getJwtRaced = (): Promise<{ access: string; refresh: string } | null> => (async () => {
+    const fast = getJwtFast();
+    const raced = await Promise.race([
+      fast,
+      new Promise<'timeout'>(r => setTimeout(() => r('timeout'), 600)),
+    ]);
+    if (raced && raced !== 'timeout') return raced;
+    return firstValid([fast, getJwtSlow()]);
+  })();
 
   // Device check for agents (5-device limit)
   const devicePromise = user.role === 'Agent'
@@ -295,7 +305,7 @@ export async function apLogin(email: string, pin: string): Promise<{
     : Promise.resolve(new Response('{}', { status: 200 }));
 
   // Run device check and JWT race in parallel
-  const jwtPromise = raceJwt().then(r => r ?? getJwtSlow(40000)); // one retry with longer timeout if race fails
+  const jwtPromise = getJwtRaced().then(r => r ?? getJwtSlow(40000)); // one retry with longer timeout if race fails
 
   let deviceRes: Response;
   let jwtResult: { access: string; refresh: string } | null;
