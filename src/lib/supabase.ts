@@ -87,9 +87,10 @@ function baseHeaders(token?: string): Record<string, string> {
   };
 }
 
-// Tracks which base URL is currently working — start with direct Supabase
-// (lower latency); proxy is the fallback for Jio IPv4 networks.
-let _activeBase = SUPABASE_URL;
+// Tracks which base URL is currently working. Start with the Cloudflare proxy (reliable on
+// networks that block direct AWS IPs, e.g. Jio); direct Supabase is the fallback. apFetch flips
+// to whichever actually responds.
+let _activeBase = PROXY_URL;
 
 async function apFetch(path: string, opts: RequestInit = {}, timeout = 15000, token?: string): Promise<Response> {
   const hdrs = { ...baseHeaders(token), ...(opts.headers as Record<string, string> || {}) };

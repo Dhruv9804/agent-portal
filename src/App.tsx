@@ -17,6 +17,221 @@ import {
 } from './lib/supabase';
 import { startRealtimeSync, stopRealtimeSync, updateRealtimeToken } from './lib/realtimeSync';
 import { Browser } from '@capacitor/browser';
+import { jsPDF } from 'jspdf';
+
+// ── PDF Report Generator ───────────────────────────────────────────────────────
+function generateOrderReport(
+  orders: Order[],
+  customers: Customer[],
+  groupBy: 'party' | 'catalog',
+  status: 'pending' | 'delivered',
+  agentName: string
+) {
+  void customers;
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const pageW = 210;
+  const margin = 14;
+  const colW = pageW - 2 * margin;
+
+  // Filter
+  const filtered = orders.filter(o =>
+    status === 'pending' ? o.status !== 'Delivered' : o.status === 'Delivered'
+  );
+
+  // Group
+  const grouped = new Map<string, Order[]>();
+  if (groupBy === 'party') {
+    filtered.forEach(o => {
+      const key = o.customer_name || 'Unknown';
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key)!.push(o);
+    });
+  } else {
+    filtered.forEach(o => {
+      const cats = [...new Set(o.items.map(i => i.catalog_name).filter(Boolean))] as string[];
+      const keys = cats.length ? cats : ['No Catalog'];
+      keys.forEach(key => {
+        if (!grouped.has(key)) grouped.set(key, []);
+        if (!grouped.get(key)!.find(x => x.id === o.id)) grouped.get(key)!.push(o);
+      });
+    });
+  }
+  const sortedGroups = [...grouped.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
+  const totalOrders = filtered.length;
+  const totalPcs    = filtered.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.quantity, 0), 0);
+  const totalAmt    = filtered.reduce((s, o) => s + o.total_amount, 0);
+
+  const groupLabel  = groupBy === 'party' ? 'Party-wise' : 'Catalog-wise';
+  const statusLabel = status === 'pending' ? 'Pending' : 'Delivered';
+  const title       = `${groupLabel} ${statusLabel} Orders Report`;
+  const dateStr     = new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+
+  let y = 0;
+  let pageNum = 0;
+
+  const orange     = [249, 115, 22] as [number, number, number];
+  const orangeLight: [number, number, number] = [255, 237, 213];
+  const darkText   = [20, 20, 20]  as [number, number, number];
+  const grayText   = [100, 100, 100] as [number, number, number];
+  const lineGray   = [210, 210, 210] as [number, number, number];
+
+  const drawPageHeader = () => {
+    pageNum++;
+    // Orange band
+    doc.setFillColor(...orange);
+    doc.rect(0, 0, pageW, 30, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(14);
+    doc.text('KANIKA AGENTS', margin, 9);
+    doc.setFontSize(6);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(255, 220, 180);
+    doc.text('Powered by Smart Inventory Manager', margin, 14);
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(8);
+    doc.text(title.toUpperCase(), margin, 20);
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(7.5);
+    doc.text(dateStr, pageW - margin, 9, { align: 'right' });
+    doc.text(agentName, pageW - margin, 20, { align: 'right' });
+    if (pageNum > 1) doc.text(`Page ${pageNum}`, pageW - margin, 26, { align: 'right' });
+    y = 37;
+
+    if (pageNum === 1) {
+      doc.setTextColor(...grayText);
+      doc.setFontSize(7.5);
+      doc.text(
+        `${totalOrders} orders  |  ${totalPcs.toLocaleString('en-IN')} pcs  |  Rs. ${totalAmt.toLocaleString('en-IN')}`,
+        margin, y
+      );
+      y += 7;
+    }
+  };
+
+  const checkY = (needed: number) => {
+    if (y + needed > 282) { doc.addPage(); drawPageHeader(); }
+  };
+
+  // Column x positions
+  const cx = {
+    id:    margin,
+    party: margin + 14,
+    city:  margin + 64,
+    date:  margin + 99,
+    pcs:   margin + 122,
+    amt:   margin + 140,
+  };
+  const rightEdge = margin + colW;
+
+  const drawColHeaders = () => {
+    doc.setTextColor(...grayText);
+    doc.setFontSize(6.5);
+    doc.setFont('helvetica', 'bold');
+    doc.text('ORDER', cx.id, y);
+    doc.text(groupBy === 'party' ? 'CATALOGS' : 'PARTY', cx.party, y);
+    doc.text('CITY', cx.city, y);
+    doc.text('DATE', cx.date, y);
+    doc.text('PCS', cx.pcs + 12, y, { align: 'right' });
+    doc.text('AMOUNT', rightEdge, y, { align: 'right' });
+    y += 2.5;
+    doc.setDrawColor(...lineGray);
+    doc.setLineWidth(0.25);
+    doc.line(margin, y, rightEdge, y);
+    y += 4;
+  };
+
+  const drawOrderRow = (o: Order, shade: boolean) => {
+    const rowH = 7.5;
+    checkY(rowH);
+    if (shade) {
+      doc.setFillColor(248, 248, 248);
+      doc.rect(margin, y - 5, colW, rowH, 'F');
+    }
+    doc.setTextColor(...darkText);
+    doc.setFontSize(7.5);
+    doc.setFont('helvetica', 'normal');
+
+    // Order id
+    doc.text(`#${o.id}`, cx.id, y);
+
+    // Party or catalogs (second col, truncated)
+    const secCol = groupBy === 'party'
+      ? ([...new Set(o.items.map(i => i.catalog_name).filter(Boolean))].join(', ') || '-')
+      : (o.customer_name || '-');
+    const secTrunc = secCol.length > 28 ? secCol.slice(0, 27) + '...' : secCol;
+    doc.text(secTrunc, cx.party, y);
+
+    // City (truncated)
+    const city = (o.city_name || '').slice(0, 14);
+    doc.text(city, cx.city, y);
+
+    // Date
+    const d = new Date(o.created_at);
+    doc.text(`${d.getDate()} ${d.toLocaleString('en-IN', { month: 'short' })}`, cx.date, y);
+
+    // Pcs
+    const pcs = o.items.reduce((s, i) => s + i.quantity, 0);
+    doc.text(pcs.toString(), cx.pcs + 12, y, { align: 'right' });
+
+    // Amount
+    doc.text(`Rs. ${o.total_amount.toLocaleString('en-IN')}`, rightEdge, y, { align: 'right' });
+
+    y += rowH;
+  };
+
+  // Start first page
+  drawPageHeader();
+
+  sortedGroups.forEach(([groupName, groupOrders]) => {
+    checkY(22);
+
+    // Group header
+    doc.setFillColor(...orangeLight);
+    doc.rect(margin, y - 5, colW, 9, 'F');
+    doc.setTextColor(...orange);
+    doc.setFontSize(8);
+    doc.setFont('helvetica', 'bold');
+    const gNameTrunc = groupName.length > 45 ? groupName.slice(0, 44) + '…' : groupName;
+    doc.text(gNameTrunc.toUpperCase(), margin + 2, y);
+    doc.text(`${groupOrders.length} order${groupOrders.length !== 1 ? 's' : ''}`, rightEdge - 1, y, { align: 'right' });
+    y += 7;
+
+    drawColHeaders();
+
+    groupOrders.forEach((o, idx) => drawOrderRow(o, idx % 2 === 1));
+
+    // Group subtotal
+    const gPcs = groupOrders.reduce((s, o) => s + o.items.reduce((ss, i) => ss + i.quantity, 0), 0);
+    const gAmt = groupOrders.reduce((s, o) => s + o.total_amount, 0);
+    doc.setDrawColor(...lineGray);
+    doc.setLineWidth(0.25);
+    doc.line(margin, y, rightEdge, y);
+    y += 3;
+    doc.setTextColor(...grayText);
+    doc.setFontSize(7.5);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`Subtotal: ${gPcs.toLocaleString('en-IN')} pcs  |  Rs. ${gAmt.toLocaleString('en-IN')}`, rightEdge, y, { align: 'right' });
+    y += 9;
+  });
+
+  // Grand total bar
+  checkY(14);
+  doc.setFillColor(...orange);
+  doc.rect(margin, y - 4, colW, 11, 'F');
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(9);
+  doc.setFont('helvetica', 'bold');
+  doc.text('GRAND TOTAL', margin + 3, y + 3);
+  doc.text(
+    `${totalPcs.toLocaleString('en-IN')} pcs  |  Rs. ${totalAmt.toLocaleString('en-IN')}`,
+    rightEdge - 2, y + 3, { align: 'right' }
+  );
+
+  const fileName = `Kanika_${groupLabel}_${statusLabel}_${dateStr.replace(/ /g, '_')}.pdf`;
+  doc.save(fileName);
+}
 
 // ── Rate limiting ──────────────────────────────────────────────────────────────
 const AP_RATE_KEY      = 'ap_rate_limit';
@@ -1030,6 +1245,37 @@ function TutorialOverlay({ onDone }: { onDone: () => void }) {
       subtitle: 'Tap a Smart Bundle card, then "Pending Orders" to jump straight to that customer\'s orders.',
       illustration: <Step3 />,
     },
+    {
+      title: 'Smart Match',
+      subtitle: 'Search two things at once — type a catalog name + party name like "sara balakrishna" and Smart Match finds all matching orders instantly.',
+      illustration: (
+        <div className="w-full max-w-[260px] rounded-2xl overflow-hidden border border-zinc-700 bg-zinc-900 shadow-xl">
+          <div className="flex items-center gap-2 px-3 py-2.5 border-b border-zinc-800">
+            <Search size={13} className="text-amber-500 shrink-0" />
+            <span className="text-sm font-medium text-white flex-1">sara balakrishna</span>
+            <X size={11} className="text-zinc-500" />
+          </div>
+          <div className="p-2 space-y-2">
+            <div className="flex items-center gap-1.5 px-1">
+              <Sparkles size={9} className="text-violet-400" />
+              <span className="text-[9px] font-black text-violet-500 uppercase tracking-widest">Smart Match</span>
+            </div>
+            <div className="flex items-center gap-2 px-2.5 py-2 rounded-xl bg-violet-900/30 border border-violet-700/50"
+              style={{ animation: 'tutorialPulse 1.2s ease-in-out infinite', boxShadow: '0 0 10px rgba(139,92,246,0.4)' }}>
+              <div className="flex-1 space-y-1 min-w-0">
+                <div className="flex items-center gap-1 flex-wrap">
+                  <span className="flex items-center gap-0.5 bg-indigo-900/60 text-indigo-300 px-1 py-0.5 rounded text-[8px] font-black"><Users size={6} /> BALAKRISHNA SILKS</span>
+                  <span className="flex items-center gap-0.5 bg-amber-900/60 text-amber-300 px-1 py-0.5 rounded text-[8px] font-black"><BookOpen size={6} /> KAVYA SARA</span>
+                </div>
+                <div className="text-[8px] text-violet-400">2 pending orders match both</div>
+              </div>
+              <span className="bg-violet-600 text-white text-[7px] px-1.5 py-0.5 rounded-full font-black shrink-0">Apply both</span>
+            </div>
+            <div className="text-center text-[9px] text-violet-400 font-bold pt-0.5">↑ Tap to filter by both at once</div>
+          </div>
+        </div>
+      ),
+    },
   ];
 
   const current = steps[step];
@@ -1125,6 +1371,73 @@ function TutorialOverlay({ onDone }: { onDone: () => void }) {
 // ── Orders Screen ─────────────────────────────────────────────────────────────
 type OrderFilterMode = 'party' | 'catalog';
 
+// ── Smart Match: parse "sara balakrishna" → {catalog:"KAVYA SARA", party:"BALAKRISHNA SILKS"} ──
+type SmartMatchResult = { preset: FilterPreset; catalogName?: string; partyName?: string; matchCount: number };
+function parseSmartMatch(
+  query: string, customers: Customer[], catalogs: Catalog[], orders: Order[]
+): SmartMatchResult | null {
+  const q = query.trim().toLowerCase();
+  if (q.length < 3) return null;
+  if (q.split(/\s+/).length < 2) return null;
+
+  const partyNames  = customers.map(c => c.name).filter(Boolean);
+  const catalogNames = catalogs.map(c => c.name).filter(Boolean);
+
+  const orderCountP = (name: string) => orders.filter(o => o.customer_name?.toLowerCase() === name.toLowerCase() && o.status !== 'Delivered').length;
+  const orderCountC = (name: string) => orders.filter(o => o.status !== 'Delivered' && o.items.some(i => i.catalog_name?.toLowerCase() === name.toLowerCase())).length;
+
+  type Hit = { name: string; tier: number; oc: number };
+  const matchList = (text: string, list: string[], ocFn: (n: string) => number): Hit | null => {
+    const t = text.trim().toLowerCase();
+    if (!t || t.length < 2) return null;
+    const rank = (e: string): Hit => ({ name: e, tier: 0, oc: ocFn(e) });
+    const hits: Hit[] = [];
+    for (const e of list) {
+      const el = e.toLowerCase();
+      const words = el.split(/\s+/);
+      if (el === t)                                  hits.push({ ...rank(e), tier: 4 });
+      else if (words[words.length-1].startsWith(t)) hits.push({ ...rank(e), tier: 3 });
+      else if (el.startsWith(t))                    hits.push({ ...rank(e), tier: 2 });
+      else if (el.includes(t))                      hits.push({ ...rank(e), tier: 1 });
+    }
+    if (!hits.length) return null;
+    return hits.sort((a, b) => b.tier - a.tier || b.oc - a.oc || a.name.length - b.name.length)[0];
+  };
+
+  const words = q.split(/\s+/);
+  const seen = new Set<string>();
+  const candidates: Array<SmartMatchResult & { score: number }> = [];
+
+  for (let i = 1; i < words.length; i++) {
+    const left  = words.slice(0, i).join(' ');
+    const right = words.slice(i).join(' ');
+    // try left=catalog right=party and left=party right=catalog
+    for (const [cText, pText] of [[left, right], [right, left]]) {
+      const cm = matchList(cText, catalogNames, orderCountC);
+      const pm = matchList(pText, partyNames, orderCountP);
+      if (!cm || !pm) continue;
+      const key = [cm.name.toLowerCase(), pm.name.toLowerCase()].sort().join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const cust = customers.find(c => c.name === pm.name);
+      const preset: FilterPreset = { catalogName: cm.name, ...(cust ? { partyId: String(cust.id) } : {}) };
+      const matchCount = orders.filter(o => {
+        if (o.status === 'Delivered') return false;
+        const mc = o.items.some(i => i.catalog_name?.toLowerCase() === cm.name.toLowerCase());
+        const mp = !cust || o.customer_id === cust.id;
+        return mc && mp;
+      }).length;
+      const score = (cm.tier + pm.tier) * 100 + matchCount * 10 + cm.oc + pm.oc;
+      candidates.push({ preset, catalogName: cm.name, partyName: pm.name, matchCount, score });
+    }
+  }
+
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  const { score: _s, ...best } = candidates[0];
+  return best;
+}
+
 // ── GlobalSearch — universal search overlay ────────────────────────────────────
 type FilterPreset = { search?: string; partyId?: string; catalogName?: string };
 function GlobalSearch({
@@ -1174,6 +1487,13 @@ function GlobalSearch({
 
     return out;
   }, [q, customers, catalogs, orders]);
+
+  // ── Smart Match (multi-entity: catalog + party) ───────────────────────────────
+  const smartMatch = React.useMemo(() => {
+    if (q.length < 3) return null;
+    if (q.split(/\s+/).length < 2) return null;
+    return parseSmartMatch(query.trim(), customers, catalogs, orders);
+  }, [q, query, customers, catalogs, orders]);
 
   // ── Section results ───────────────────────────────────────────────────────────
   const sections = React.useMemo(() => {
@@ -1244,7 +1564,7 @@ function GlobalSearch({
                     <p className="text-xs mt-1">Orders · Parties · Catalogs</p>
                   </div>
                 </div>
-              ) : totalCount === 0 && bundles.length === 0 ? (
+              ) : totalCount === 0 && bundles.length === 0 && !smartMatch ? (
                 <div className="flex flex-col items-center justify-center py-12 gap-3 text-zinc-400">
                   <FileX size={32} strokeWidth={1.5} />
                   <div className="text-center">
@@ -1254,6 +1574,39 @@ function GlobalSearch({
                 </div>
               ) : (
                 <div className="p-3 space-y-3">
+
+                  {/* Smart Match (multi-entity) */}
+                  {smartMatch && (
+                    <div>
+                      <div className="flex items-center gap-2 px-2 pb-1.5">
+                        <Sparkles size={11} className="text-violet-400" />
+                        <span className="text-[10px] font-black uppercase tracking-widest text-violet-500">Smart Match</span>
+                      </div>
+                      <button
+                        onClick={() => { onNavigate('orders', smartMatch.preset); onClose(); }}
+                        className="flex items-center gap-2 px-3 py-2.5 rounded-xl border bg-violet-50 dark:bg-violet-900/20 border-violet-200 dark:border-violet-700 text-violet-700 dark:text-violet-300 text-xs font-bold w-full hover:shadow-sm transition-all text-left"
+                      >
+                        <div className="flex-1 min-w-0 space-y-0.5">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {smartMatch.partyName && (
+                              <span className="flex items-center gap-1 bg-indigo-100 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 px-1.5 py-0.5 rounded-md text-[10px] font-black">
+                                <Users size={8} /> {smartMatch.partyName}
+                              </span>
+                            )}
+                            {smartMatch.catalogName && (
+                              <span className="flex items-center gap-1 bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 px-1.5 py-0.5 rounded-md text-[10px] font-black">
+                                <BookOpen size={8} /> {smartMatch.catalogName}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[10px] text-violet-500 dark:text-violet-400">
+                            {smartMatch.matchCount} pending order{smartMatch.matchCount !== 1 ? 's' : ''} match both filters
+                          </p>
+                        </div>
+                        <span className="bg-violet-600 text-white text-[9px] px-1.5 py-0.5 rounded-full font-black shrink-0 whitespace-nowrap">Apply both</span>
+                      </button>
+                    </div>
+                  )}
 
                   {/* Smart Bundles */}
                   {bundles.length > 0 && (
@@ -1358,9 +1711,20 @@ function OrdersScreen({ orders, customers, filterPreset }: {
   // Apply external filter preset when it changes (from GlobalSearch)
   useEffect(() => {
     if (!filterPreset) return;
-    if (filterPreset.search)      { setSearch(filterPreset.search); setFilterParty(''); setFilterCatalog(''); }
-    if (filterPreset.partyId)     { setFilterParty(filterPreset.partyId); setFilterMode('party'); setSearch(''); setFilterCatalog(''); }
-    if (filterPreset.catalogName) { setFilterCatalog(filterPreset.catalogName); setFilterMode('catalog'); setSearch(''); setFilterParty(''); }
+    if (filterPreset.search) {
+      // Plain text search
+      setSearch(filterPreset.search); setFilterParty(''); setFilterCatalog('');
+    } else if (filterPreset.partyId && filterPreset.catalogName) {
+      // Smart Match: both party + catalog active simultaneously
+      setFilterParty(filterPreset.partyId);
+      setFilterCatalog(filterPreset.catalogName);
+      setSearch('');
+      setFilterMode('party');
+    } else if (filterPreset.partyId) {
+      setFilterParty(filterPreset.partyId); setFilterMode('party'); setSearch(''); setFilterCatalog('');
+    } else if (filterPreset.catalogName) {
+      setFilterCatalog(filterPreset.catalogName); setFilterMode('catalog'); setSearch(''); setFilterParty('');
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filterPreset]);
 
@@ -1433,22 +1797,46 @@ function OrdersScreen({ orders, customers, filterPreset }: {
 
         {/* Active filter chip / search hint */}
         {(filterParty || filterCatalog || search) ? (
-          <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl">
-            <Search size={12} className="text-amber-500 shrink-0" />
-            <span className="text-[11px] font-bold text-amber-700 dark:text-amber-400 flex-1 truncate">
-              {filterParty
-                ? `Party: ${customers.find(c => String(c.id) === filterParty)?.name || filterParty}`
-                : filterCatalog
-                  ? `Catalog: ${filterCatalog}`
-                  : `Search: "${search}"`}
-            </span>
-            <button
-              onClick={() => { setSearch(''); setFilterParty(''); setFilterCatalog(''); }}
-              className="shrink-0 w-5 h-5 rounded-full bg-amber-200 dark:bg-amber-700 flex items-center justify-center active:scale-90 transition-transform"
-            >
-              <X size={10} className="text-amber-700 dark:text-amber-200" />
-            </button>
-          </div>
+          filterParty && filterCatalog ? (
+            // Smart Match: both filters active — show combined violet chip
+            <div className="flex items-center gap-2 px-3 py-2 bg-violet-50 dark:bg-violet-900/20 border border-violet-300 dark:border-violet-700 rounded-xl">
+              <Sparkles size={12} className="text-violet-500 shrink-0" />
+              <span className="text-[11px] font-bold text-violet-700 dark:text-violet-300 flex-1 min-w-0">
+                <span className="inline-flex items-center gap-1">
+                  <Users size={9} className="shrink-0" />
+                  <span className="truncate">{customers.find(c => String(c.id) === filterParty)?.name || filterParty}</span>
+                </span>
+                <span className="mx-1 text-violet-400">+</span>
+                <span className="inline-flex items-center gap-1">
+                  <BookOpen size={9} className="shrink-0" />
+                  <span className="truncate">{filterCatalog}</span>
+                </span>
+              </span>
+              <button
+                onClick={() => { setSearch(''); setFilterParty(''); setFilterCatalog(''); }}
+                className="shrink-0 w-5 h-5 rounded-full bg-violet-200 dark:bg-violet-700 flex items-center justify-center active:scale-90 transition-transform"
+              >
+                <X size={10} className="text-violet-700 dark:text-violet-200" />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-xl">
+              <Search size={12} className="text-amber-500 shrink-0" />
+              <span className="text-[11px] font-bold text-amber-700 dark:text-amber-400 flex-1 truncate">
+                {filterParty
+                  ? `Party: ${customers.find(c => String(c.id) === filterParty)?.name || filterParty}`
+                  : filterCatalog
+                    ? `Catalog: ${filterCatalog}`
+                    : `Search: "${search}"`}
+              </span>
+              <button
+                onClick={() => { setSearch(''); setFilterParty(''); setFilterCatalog(''); }}
+                className="shrink-0 w-5 h-5 rounded-full bg-amber-200 dark:bg-amber-700 flex items-center justify-center active:scale-90 transition-transform"
+              >
+                <X size={10} className="text-amber-700 dark:text-amber-200" />
+              </button>
+            </div>
+          )
         ) : (
           <p className="text-[11px] text-zinc-400 text-center">
             Use search bar to search order details for a customer or a catalog.
@@ -1719,6 +2107,9 @@ export default function App() {
   const [gsOpen, setGsOpen]             = useState(false);
   const [gsQuery, setGsQuery]           = useState('');
   const [orderPreset, setOrderPreset]   = useState<FilterPreset | undefined>(undefined);
+
+  // Download menu state
+  const [dlMenuOpen, setDlMenuOpen]     = useState(false);
 
   const showToast = useCallback((msg: string, type: 'error' | 'success' | 'info') => {
     setToast({ msg, type });
@@ -2001,6 +2392,54 @@ export default function App() {
           <p className="text-[10px] font-bold text-amber-500 uppercase tracking-widest leading-none">Kanika Agents</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* Download reports button — only on Orders tab */}
+          {activeTab === 'orders' && (
+            <div className="relative">
+              <button
+                onClick={() => setDlMenuOpen(v => !v)}
+                className="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center text-zinc-500 active:scale-95 transition-transform">
+                <Download size={15} />
+              </button>
+              {dlMenuOpen && (
+                <>
+                  {/* Backdrop */}
+                  <div className="fixed inset-0 z-40" onClick={() => setDlMenuOpen(false)} />
+                  {/* Dropdown */}
+                  <div className="absolute right-0 top-11 z-50 w-64 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-2xl shadow-2xl overflow-hidden">
+                    <div className="px-4 py-2.5 border-b border-zinc-100 dark:border-zinc-800">
+                      <p className="text-[10px] font-black text-zinc-400 uppercase tracking-widest">Download Report</p>
+                    </div>
+                    {([
+                      { label: 'Party-wise Pending',   groupBy: 'party',   status: 'pending'   },
+                      { label: 'Catalog-wise Pending',  groupBy: 'catalog', status: 'pending'   },
+                      { label: 'Party-wise Delivered',  groupBy: 'party',   status: 'delivered' },
+                      { label: 'Catalog-wise Delivered',groupBy: 'catalog', status: 'delivered' },
+                    ] as const).map(opt => (
+                      <button
+                        key={opt.label}
+                        onClick={() => {
+                          setDlMenuOpen(false);
+                          generateOrderReport(
+                            orders, customers,
+                            opt.groupBy, opt.status,
+                            session?.name || session?.email || 'Agent'
+                          );
+                        }}
+                        className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors border-b border-zinc-100 dark:border-zinc-800 last:border-0">
+                        <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${opt.status === 'pending' ? 'bg-orange-100 dark:bg-orange-900/30' : 'bg-emerald-100 dark:bg-emerald-900/30'}`}>
+                          <FileText size={14} className={opt.status === 'pending' ? 'text-orange-500' : 'text-emerald-500'} />
+                        </div>
+                        <div>
+                          <p className="text-xs font-bold text-zinc-800 dark:text-zinc-100">{opt.label}</p>
+                          <p className="text-[10px] text-zinc-400">PDF · Orders report</p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
           <button onClick={() => { setGsOpen(true); setGsQuery(''); }}
             className="w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center text-zinc-500">
             <Search size={15} />

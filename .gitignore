@@ -4,3 +4,6 @@ android/
 ios/
 .env
 *.local
+.DS_Store
+**/.DS_Store
+*.tsbuildinfo
