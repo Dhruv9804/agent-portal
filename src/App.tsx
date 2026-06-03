@@ -236,7 +236,7 @@ function generateOrderReport(
 // ── Rate limiting ──────────────────────────────────────────────────────────────
 const AP_RATE_KEY      = 'ap_rate_limit';
 const AP_MAX_ATTEMPTS  = 5;
-const AP_LOCKOUT_MS    = 15 * 60 * 1000;
+const AP_LOCKOUT_MS    = 5 * 60 * 1000;
 function getRateData() {
   try { return JSON.parse(sessionStorage.getItem(AP_RATE_KEY) || '{}'); } catch { return { attempts: 0, lockedUntil: 0 }; }
 }
