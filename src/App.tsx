@@ -16,6 +16,7 @@ import {
   Agent, Customer, Order, Challan, Catalog, CatalogCategory, Volume, LikeData,
 } from './lib/supabase';
 import { startRealtimeSync, stopRealtimeSync, updateRealtimeToken } from './lib/realtimeSync';
+import { initPush } from './lib/push';
 import { Browser } from '@capacitor/browser';
 import { jsPDF } from 'jspdf';
 
@@ -2193,6 +2194,15 @@ export default function App() {
   useEffect(() => {
     if (!session) return;
     loadAllData(session);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.email]);
+
+  // ── Push notifications ────────────────────────────────────────────────────
+  // Register once a session exists. The getter reads the latest saved session so
+  // the token saves under a freshly-refreshed JWT.
+  useEffect(() => {
+    if (!session) return;
+    initPush(() => { const s = loadSession(); return { email: s?.email ?? null, token: s?.accessToken ?? null }; });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.email]);
 

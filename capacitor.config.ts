@@ -1,7 +1,7 @@
 import { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.kanika.agents',
+  appId: 'com.dhruv.agents',
   appName: 'Kanika Agents',
   webDir: 'dist',
   server: {
@@ -14,6 +14,10 @@ const config: CapacitorConfig = {
   ios: {
     backgroundColor: '#09090b',
     contentInset: 'automatic',
+  },
+  plugins: {
+    // Show push notifications as a banner even while the app is in the foreground (iOS).
+    PushNotifications: { presentationOptions: ['badge', 'sound', 'alert'] },
   },
 };
 

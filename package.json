@@ -20,6 +20,7 @@
     "@capacitor/core": "^8.3.1",
     "@capacitor/filesystem": "^8.1.2",
     "@capacitor/ios": "^8.3.4",
+    "@capacitor/push-notifications": "^8.1.1",
     "@capacitor/share": "^8.0.1",
     "@emotion/is-prop-valid": "^1.4.0",
     "@supabase/realtime-js": "^2.106.2",
