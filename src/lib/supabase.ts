@@ -87,10 +87,10 @@ function baseHeaders(token?: string): Record<string, string> {
   };
 }
 
-// Tracks which base URL is currently working. Start with the Cloudflare proxy (reliable on
-// networks that block direct AWS IPs, e.g. Jio); direct Supabase is the fallback. apFetch flips
-// to whichever actually responds.
-let _activeBase = PROXY_URL;
+// Tracks which base URL is currently working. DIRECT-FIRST: start on direct Supabase (lowest latency,
+// bypasses the Worker); the Cloudflare proxy is the fallback for networks that block direct AWS IPs.
+// apFetch flips to whichever actually responds.
+let _activeBase = SUPABASE_URL;
 
 async function apFetch(path: string, opts: RequestInit = {}, timeout = 15000, token?: string): Promise<Response> {
   const hdrs = { ...baseHeaders(token), ...(opts.headers as Record<string, string> || {}) };
@@ -150,7 +150,27 @@ export async function apRefreshToken(refreshToken: string): Promise<{ accessToke
 // ── Sign-up (agent request) ───────────────────────────────────────────────────
 export async function submitAgentRequest(
   agencyName: string, applicantName: string, phone: string, email: string
-): Promise<{ error?: string }> {
+): Promise<{ error?: string; alreadyExists?: boolean }> {
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanPhone = phone.replace(/\D/g, '').trim();
+  // Dedupe: if already a registered agent / open request, point them to "Forgot PIN" — don't duplicate.
+  // Best-effort; a DB trigger on cv_agent_requests is the hard backstop.
+  try {
+    const pre = await apFetch('/rest/v1/rpc/cv_agent_request_precheck', {
+      method: 'POST', body: JSON.stringify({ p_email: cleanEmail, p_phone: cleanPhone }),
+    }, 10000);
+    if (pre.ok) {
+      const d = await pre.json().catch(() => ({} as any));
+      if (d?.exists) {
+        return {
+          alreadyExists: true,
+          error: d.reason === 'pending'
+            ? 'You already have a pending agent request — please wait for it to be approved.'
+            : 'You’re already registered. Forgot your PIN? Use “Forgot PIN” on the login screen to reset it.',
+        };
+      }
+    }
+  } catch { /* best-effort — the DB trigger still blocks true duplicates */ }
   try {
     const res = await apFetch('/rest/v1/cv_agent_requests', {
       method: 'POST',
@@ -158,15 +178,84 @@ export async function submitAgentRequest(
       body: JSON.stringify({
         agency_name:    agencyName.trim(),
         applicant_name: applicantName.trim(),
-        phone:          phone.replace(/\D/g, '').trim(),
-        email:          email.trim().toLowerCase(),
+        phone:          cleanPhone,
+        email:          cleanEmail,
         status:         'pending',
       }),
     }, 15000);
     if (res.ok || res.status === 201) return {};
     const d = await res.json().catch(() => ({}));
+    if (res.status === 409 || d.code === '23505' || /already exists/i.test(d.message || '')) {
+      return { alreadyExists: true, error: 'You’re already registered. Use “Forgot PIN” on the login screen to reset your PIN.' };
+    }
     return { error: d.message || d.error || `Server error (${res.status})` };
   } catch (e: any) { return { error: e?.message || 'Network error. Please try again.' }; }
+}
+
+// ── Forgot PIN (email OTP → reset) — mirrors catalog-viewer; uses the shared forgot-pin Edge Function ──
+export async function apForgotPinRequest(email: string): Promise<{ error?: string }> {
+  try {
+    const res = await apFetch('/functions/v1/forgot-pin', {
+      method: 'POST', body: JSON.stringify({ action: 'request', email: email.trim().toLowerCase() }),
+    }, 20000);
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d?.error) return { error: d?.error || `Could not send code (${res.status}).` };
+    return {};
+  } catch (e: any) { return { error: e?.message || 'Network error.' }; }
+}
+export async function apForgotPinReset(email: string, otp: string, newPin: string): Promise<{ error?: string }> {
+  try {
+    const res = await apFetch('/functions/v1/forgot-pin', {
+      method: 'POST', body: JSON.stringify({ action: 'reset', email: email.trim().toLowerCase(), otp: otp.trim(), newPin: newPin.trim() }),
+    }, 20000);
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d?.error) return { error: d?.error || `Could not reset PIN (${res.status}).` };
+    return {};
+  } catch (e: any) { return { error: e?.message || 'Network error.' }; }
+}
+
+// ── WhatsApp phone verification (Phase-1 signup gate → whatsapp-otp edge function) ──
+export async function apSendWhatsappOtp(phone: string): Promise<{ error?: string }> {
+  try {
+    const res = await apFetch('/functions/v1/whatsapp-otp', {
+      method: 'POST', body: JSON.stringify({ action: 'send', phone: phone.trim() }),
+    }, 20000);
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d?.error) return { error: d?.error || `Could not send code (${res.status}).` };
+    return {};
+  } catch (e: any) { return { error: e?.message || 'Network error.' }; }
+}
+export async function apVerifyWhatsappOtp(phone: string, otp: string): Promise<{ verified: boolean; error?: string }> {
+  try {
+    const res = await apFetch('/functions/v1/whatsapp-otp', {
+      method: 'POST', body: JSON.stringify({ action: 'verify', phone: phone.trim(), otp: otp.trim() }),
+    }, 20000);
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d?.error) return { verified: false, error: d?.error || `Verification failed (${res.status}).` };
+    return { verified: !!d?.verified };
+  } catch (e: any) { return { verified: false, error: e?.message || 'Network error.' }; }
+}
+
+// ── Email verification (signup front gate → email-otp edge function) ──
+export async function apSendEmailOtp(email: string): Promise<{ error?: string }> {
+  try {
+    const res = await apFetch('/functions/v1/email-otp', {
+      method: 'POST', body: JSON.stringify({ action: 'send', email: email.trim().toLowerCase() }),
+    }, 20000);
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d?.error) return { error: d?.error || `Could not send code (${res.status}).` };
+    return {};
+  } catch (e: any) { return { error: e?.message || 'Network error.' }; }
+}
+export async function apVerifyEmailOtp(email: string, otp: string): Promise<{ verified: boolean; error?: string }> {
+  try {
+    const res = await apFetch('/functions/v1/email-otp', {
+      method: 'POST', body: JSON.stringify({ action: 'verify', email: email.trim().toLowerCase(), otp: otp.trim() }),
+    }, 20000);
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d?.error) return { verified: false, error: d?.error || `Verification failed (${res.status}).` };
+    return { verified: !!d?.verified };
+  } catch (e: any) { return { verified: false, error: e?.message || 'Network error.' }; }
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────

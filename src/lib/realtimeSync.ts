@@ -46,7 +46,7 @@ let _onChanged:        (() => void) | null   = null;
 let _onSessionRevoked: (() => void) | null   = null;
 let _watchedEmail:     string | undefined;
 let _token:            string | undefined;
-let _kind:             Transport = 'proxy';
+let _kind:             Transport = 'direct';
 let _fails           = 0;
 let _stopped         = false;
 let _timer:            ReturnType<typeof setTimeout> | null = null;
@@ -89,7 +89,7 @@ export function startRealtimeSync(
   _onSessionRevoked = onSessionRevoked ?? null;
   _watchedEmail     = userEmail;
   _token            = accessToken;
-  _kind             = 'proxy';
+  _kind             = 'direct';
   _fails            = 0;
   _stopped          = false;
 

@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import {
   APSession, apLogin, apChangePin, apRefreshToken, clearSession, loadSession, saveSession,
-  submitAgentRequest, warmUpEdgeFunction, jwtIsExpired,
+  submitAgentRequest, apForgotPinRequest, apForgotPinReset, apSendEmailOtp, apVerifyEmailOtp, warmUpEdgeFunction, jwtIsExpired,
   fetchAgentId, fetchAgentNameFromDb, fetchMyCustomers, fetchOrdersByAgent, fetchMyChallans,
   fetchCatalogs, fetchVolumes, enrichWithVolumes, resolveStorageUrl, preBatchSignUrls,
   fetchLikes, toggleLike,
@@ -267,6 +267,145 @@ function Toast({ msg, type, onDone }: { msg: string; type: 'error' | 'success' |
   );
 }
 
+// ── Forgot PIN (email OTP → reset) — ported from catalog-viewer, amber theme ───────────────────────
+function ApForgotPinScreen({ onBack, showToast, initialEmail }: {
+  onBack: () => void; showToast: (m: string, t: 'error' | 'success' | 'info') => void; initialEmail?: string;
+}) {
+  const [step, setStep]             = useState<'request' | 'reset'>('request');
+  const [email, setEmail]           = useState(initialEmail || '');
+  const [otp, setOtp]               = useState('');
+  const [newPin, setNewPin]         = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
+  const [loading, setLoading]       = useState(false);
+  const inputCls = "w-full pl-10 pr-4 py-3.5 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 font-medium text-sm focus:ring-2 focus:ring-amber-500/20 focus:border-amber-400 text-zinc-900 dark:text-zinc-100";
+
+  const sendCode = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!email.trim()) { showToast('Enter your email address.', 'error'); return; }
+    setLoading(true);
+    const { error } = await apForgotPinRequest(email);
+    setLoading(false);
+    if (error) { showToast(error, 'error'); return; }
+    showToast('A 6-digit code was sent to your email.', 'success');
+    setStep('reset');
+  };
+  const doReset = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (otp.trim().length < 4) { showToast('Enter the code from your email.', 'error'); return; }
+    if (newPin.length < 4)     { showToast('New PIN must be at least 4 characters.', 'error'); return; }
+    if (newPin !== confirmPin) { showToast('PINs do not match.', 'error'); return; }
+    setLoading(true);
+    const { error } = await apForgotPinReset(email, otp, newPin);
+    setLoading(false);
+    if (error) { showToast(error, 'error'); return; }
+    showToast('PIN reset! Please log in with your new PIN.', 'success');
+    onBack();
+  };
+
+  return (
+    <div className="space-y-4">
+      <button onClick={onBack} className="flex items-center gap-1 text-xs font-bold text-zinc-400"><ChevronLeft size={14} /> Back to login</button>
+      <div>
+        <h2 className="font-black text-lg text-zinc-900 dark:text-zinc-100">Reset your PIN</h2>
+        <p className="text-xs text-zinc-400 mt-1">{step === 'request' ? "We'll email you a 6-digit code." : 'Enter the code from your email and choose a new PIN.'}</p>
+      </div>
+      {step === 'request' ? (
+        <form onSubmit={sendCode} className="space-y-4">
+          <div className="relative">
+            <Mail size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
+            <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="your@email.com" className={inputCls} autoCapitalize="none" autoComplete="email" />
+          </div>
+          <button type="submit" disabled={loading} className="w-full py-4 bg-amber-500 hover:bg-amber-600 text-white font-black rounded-2xl disabled:opacity-60 flex items-center justify-center gap-2">
+            {loading ? <Loader2 size={18} className="animate-spin" /> : <Mail size={18} />} {loading ? 'Sending…' : 'Send code'}
+          </button>
+        </form>
+      ) : (
+        <form onSubmit={doReset} className="space-y-4">
+          <div className="relative">
+            <Key size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
+            <input type="text" inputMode="numeric" value={otp} onChange={e => setOtp(e.target.value)} placeholder="6-digit code" className={inputCls} autoComplete="one-time-code" />
+          </div>
+          <div className="relative">
+            <Lock size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
+            <input type="password" value={newPin} onChange={e => setNewPin(e.target.value)} placeholder="New PIN (min 4)" className={inputCls} />
+          </div>
+          <div className="relative">
+            <Lock size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
+            <input type="password" value={confirmPin} onChange={e => setConfirmPin(e.target.value)} placeholder="Confirm new PIN" className={inputCls} />
+          </div>
+          <button type="submit" disabled={loading} className="w-full py-4 bg-amber-500 hover:bg-amber-600 text-white font-black rounded-2xl disabled:opacity-60 flex items-center justify-center gap-2">
+            {loading ? <Loader2 size={18} className="animate-spin" /> : <Key size={18} />} {loading ? 'Resetting…' : 'Reset PIN'}
+          </button>
+          <button type="button" onClick={sendCode} className="w-full text-center text-xs font-bold text-zinc-400">Resend code</button>
+        </form>
+      )}
+    </div>
+  );
+}
+
+// ── Email-verification gate (signup front gate; validates the email via the email-otp EF) ──
+function EmailVerify({ email, onChange, showToast }: {
+  email: string;
+  onChange: (verified: boolean) => void;
+  showToast: (m: string, t: 'error' | 'success' | 'info') => void;
+}) {
+  const [sent, setSent] = useState(false);
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [ok, setOk]     = useState(false);
+  const valid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+
+  useEffect(() => { setSent(false); setCode(''); setOk(false); onChange(false); }, [email]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const send = async () => {
+    if (!valid) { showToast('Enter a valid email first.', 'error'); return; }
+    setBusy(true);
+    const { error } = await apSendEmailOtp(email);
+    setBusy(false);
+    if (error) { showToast(error, 'error'); return; }
+    setSent(true); showToast('Verification code sent to your email.', 'success');
+  };
+  const verify = async () => {
+    if (code.length < 4) { showToast('Enter the code from your email.', 'error'); return; }
+    setBusy(true);
+    const { verified, error } = await apVerifyEmailOtp(email, code);
+    setBusy(false);
+    if (verified) { setOk(true); onChange(true); showToast('Email verified ✓', 'success'); }
+    else showToast(error || 'Invalid code.', 'error');
+  };
+
+  if (ok) return (
+    <div className="flex items-center gap-2 px-3 py-2.5 rounded-2xl bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800">
+      <Check size={15} className="text-emerald-600" />
+      <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400">Email verified</span>
+    </div>
+  );
+  return (
+    <div className="space-y-2">
+      {!sent ? (
+        <button type="button" onClick={send} disabled={busy || !valid}
+          className="w-full py-3 rounded-2xl border border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-400 font-black text-sm disabled:opacity-50 flex items-center justify-center gap-2">
+          {busy ? <Loader2 size={16} className="animate-spin" /> : <Mail size={16} />}
+          Verify email address
+        </button>
+      ) : (
+        <>
+          <div className="flex gap-2">
+            <input type="tel" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="Email code"
+              className="flex-1 px-4 py-3 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 font-bold text-sm tracking-[0.3em] text-center text-zinc-900 dark:text-zinc-100" />
+            <button type="button" onClick={verify} disabled={busy}
+              className="px-5 py-3 rounded-2xl bg-emerald-600 text-white font-black text-sm disabled:opacity-50">
+              {busy ? <Loader2 size={16} className="animate-spin" /> : 'Verify'}
+            </button>
+          </div>
+          <button type="button" onClick={send} disabled={busy} className="text-[11px] font-bold text-zinc-400 hover:text-zinc-600">Resend code</button>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Agent Sign-Up Screen ───────────────────────────────────────────────────────
 function AgentSignupScreen({ onBack, showToast }: {
   onBack: () => void;
@@ -278,6 +417,7 @@ function AgentSignupScreen({ onBack, showToast }: {
   const [email, setEmail]           = useState('');
   const [loading, setLoading]       = useState(false);
   const [done, setDone]             = useState(false);
+  const [emailVerified, setEmailVerified] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -290,6 +430,7 @@ function AgentSignupScreen({ onBack, showToast }: {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       showToast('Enter a valid email address.', 'error'); return;
     }
+    if (!emailVerified) { showToast('Please verify your email first.', 'error'); return; }
     setLoading(true);
     const { error } = await submitAgentRequest(agencyName, name, phone, email);
     setLoading(false);
@@ -304,8 +445,8 @@ function AgentSignupScreen({ onBack, showToast }: {
       </div>
       <h3 className="text-xl font-black text-zinc-900 dark:text-zinc-100">Request Submitted!</h3>
       <p className="text-sm text-zinc-500 max-w-xs">
-        Your agent access request has been sent for review. Our team will reach out to you at{' '}
-        <strong className="text-zinc-900 dark:text-zinc-100">{email}</strong> once approved.
+        Your agent access request has been sent for review. Once approved, your login PIN will be sent to your WhatsApp at{' '}
+        <strong className="text-zinc-900 dark:text-zinc-100">{phone}</strong>.
       </p>
       <button onClick={onBack} className="mt-4 px-6 py-3 bg-amber-500 text-white rounded-2xl font-black text-sm">
         Back to Login
@@ -319,26 +460,46 @@ function AgentSignupScreen({ onBack, showToast }: {
         <ChevronLeft size={14} /> Back
       </button>
       {[
-        { label: 'Agency Name',    icon: Building2, val: agencyName, set: setAgencyName, ph: 'Your agency / firm name',  type: 'text'  },
-        { label: 'Your Name',      icon: ShieldCheck, val: name,      set: setName,       ph: 'Full name',               type: 'text'  },
-        { label: 'Phone Number',   icon: Phone,      val: phone,     set: setPhone,      ph: '10-digit mobile',          type: 'tel'   },
-        { label: 'Email Address',  icon: Mail,       val: email,     set: setEmail,      ph: 'your@email.com',           type: 'email' },
+        { label: 'Agency Name', icon: Building2,   val: agencyName, set: setAgencyName, ph: 'Your agency / firm name', type: 'text' },
+        { label: 'Your Name',   icon: ShieldCheck, val: name,       set: setName,       ph: 'Full name',              type: 'text' },
       ].map(({ label, icon: Icon, val, set, ph, type }) => (
         <div key={label}>
           <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest pl-1">{label}</label>
           <div className="relative mt-1">
             <Icon size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
-            <input type={type} value={val} onChange={e => set(e.target.value)} placeholder={ph}
-              autoCapitalize={type === 'email' ? 'none' : 'words'}
+            <input type={type} value={val} onChange={e => set(e.target.value)} placeholder={ph} autoCapitalize="words"
               className="w-full pl-10 pr-4 py-3.5 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 font-medium text-sm focus:ring-2 focus:ring-amber-500/20 focus:border-amber-400 text-zinc-900 dark:text-zinc-100" />
           </div>
         </div>
       ))}
-      <button type="submit" disabled={loading}
-        className="w-full py-4 bg-amber-500 hover:bg-amber-600 text-white font-black rounded-2xl shadow-lg disabled:opacity-60 flex items-center justify-center gap-2">
-        {loading ? <Loader2 size={18} className="animate-spin" /> : <ShieldCheck size={18} />}
-        {loading ? 'Submitting...' : 'Submit Request'}
-      </button>
+      <div>
+        <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest pl-1">Email Address</label>
+        <div className="relative mt-1">
+          <Mail size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
+          <input type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="your@email.com" autoCapitalize="none"
+            className="w-full pl-10 pr-4 py-3.5 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 font-medium text-sm focus:ring-2 focus:ring-amber-500/20 focus:border-amber-400 text-zinc-900 dark:text-zinc-100" />
+        </div>
+        <p className="text-[10px] text-zinc-400 pl-1 mt-1">You'll receive a verification OTP on this email.</p>
+      </div>
+      <EmailVerify email={email} onChange={setEmailVerified} showToast={showToast} />
+      {emailVerified && (
+        <>
+          <div>
+            <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest pl-1">Phone Number (WhatsApp)</label>
+            <div className="relative mt-1">
+              <Phone size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400" />
+              <input type="tel" value={phone} onChange={e => setPhone(e.target.value)} placeholder="10-digit mobile"
+                className="w-full pl-10 pr-4 py-3.5 rounded-2xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 font-medium text-sm focus:ring-2 focus:ring-amber-500/20 focus:border-amber-400 text-zinc-900 dark:text-zinc-100" />
+            </div>
+            <p className="text-[10px] text-zinc-400 pl-1 mt-1">Your login PIN (once approved) will be sent to this WhatsApp number.</p>
+          </div>
+          <button type="submit" disabled={loading}
+            className="w-full py-4 bg-amber-500 hover:bg-amber-600 text-white font-black rounded-2xl shadow-lg disabled:opacity-60 flex items-center justify-center gap-2">
+            {loading ? <Loader2 size={18} className="animate-spin" /> : <ShieldCheck size={18} />}
+            {loading ? 'Submitting...' : 'Submit Request'}
+          </button>
+        </>
+      )}
     </form>
   );
 }
@@ -402,7 +563,7 @@ function LoginScreen({ onSuccess, showToast }: {
   onSuccess: (s: APSession) => void;
   showToast: (m: string, t: 'error' | 'success' | 'info') => void;
 }) {
-  const [tab, setTab]           = useState<'login' | 'signup'>('login');
+  const [tab, setTab]           = useState<'login' | 'signup' | 'forgot'>('login');
   const [email, setEmail]       = useState('');
   const [pin, setPin]           = useState('');
   const [loading, setLoading]   = useState(false);
@@ -496,6 +657,8 @@ function LoginScreen({ onSuccess, showToast }: {
           <div className="p-6">
             {tab === 'signup' ? (
               <AgentSignupScreen onBack={() => setTab('login')} showToast={showToast} />
+            ) : tab === 'forgot' ? (
+              <ApForgotPinScreen onBack={() => setTab('login')} showToast={showToast} initialEmail={email} />
             ) : (
               <form onSubmit={handleLogin} className="space-y-4">
                 <div>
@@ -521,6 +684,7 @@ function LoginScreen({ onSuccess, showToast }: {
                   {loading ? <Loader2 size={18} className="animate-spin" /> : <Key size={18} />}
                   {loading ? 'Signing in…' : lockoutRemaining > 0 ? `Locked (${lockoutRemaining}s)` : 'Sign In'}
                 </button>
+                <button type="button" onClick={() => setTab('forgot')} className="w-full text-center text-sm font-bold text-amber-600 dark:text-amber-400 py-2.5 mt-1 rounded-2xl border border-amber-200 dark:border-amber-800 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors">Forgot PIN? Reset it →</button>
                 {lockoutRemaining > 0 && (
                   <button type="button"
                     onClick={() => { try { sessionStorage.removeItem(AP_RATE_KEY); } catch { /**/ } setLockoutRemaining(0); }}
